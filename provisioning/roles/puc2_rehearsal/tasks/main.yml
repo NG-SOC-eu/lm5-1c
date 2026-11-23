@@ -1,0 +1,790 @@
+---
+# =============================================================================
+# role: puc2_rehearsal   (hosts: ng-siem, victim, docker-server — every build)
+#
+# On its own, against an already-provisioned sandbox:
+#   ansible-playbook provisioning/playbook.yml \
+#     --tags puc2_rehearsal --limit ng-siem,victim,docker-server
+#
+# WHY THIS EXISTS
+# puc2_preflight proves, statically, that every graded answer is OBTAINABLE: the
+# rules load, the watchlist carries the hash, the markers' script is in place.
+# What it deliberately never does is FIRE the attack — so nothing has confirmed
+# in runtime that rule 100101 actually alerts (L10), that 100103 correlates
+# (L11/L12), or that the active response writes the markers (L19/L20/L21). That
+# is the one place a student could still be blocked. This role closes it: it
+# fires the real scenario, watches every link of
+#   100101 -> 100102 -> 100103 -> active response -> markers -> quarantine
+# and then removes every trace, so the range is handed to the student exactly as
+# provisioning left it — never "already attacked".
+#
+# SAFETY MODEL
+# - It runs BEFORE handover, never against a range in use by students.
+# - puc2_rehearsal_enabled=false skips it cleanly, for a smoke deploy.
+# - block/rescue/always: cleanup runs whether the chain passes, fails, or errors.
+# - Tasks are guarded by inventory_hostname; the manager-side checks run on
+#   ng-siem, the endpoint side on victim. On docker-server the drill snapshots
+#   CICMS before firing and deletes the cases custom-iris created for its
+#   alerts afterwards; the trailing preflight re-run reproves all three hosts.
+#
+# The full-pristine completion (baseline restart, credential restore, alerts.log
+# purge) and the preflight re-run land in the next change on this branch; the
+# `always` here already performs the essential rollback so the role is safe to
+# run on its own.
+# =============================================================================
+
+# A disabled rehearsal is a deliberate operator choice, not an error — so it
+# skips rather than fails. It does not skip QUIETLY: the whole point of promoting
+# this role into the build is that "the runtime chain was never exercised" must
+# never again be something you can only discover by reading 5,000 lines of
+# deployment log.
+- name: Announce that the runtime chain will NOT be proven
+  ansible.builtin.debug:
+    msg: >-
+      REHEARSAL SKIPPED (puc2_rehearsal_enabled=false) — this range ships
+      WITHOUT runtime proof of 100101 -> 100102 -> 100103 -> active response ->
+      markers -> quarantine. The preflight gate below still proves every graded
+      answer is obtainable statically, but nothing here confirms that rule
+      100101's CDB lookup resolves, that 100103 correlates, or that containment
+      writes the markers L19/L21 grade. Re-run without the flag before handing
+      the sandbox to students.
+  run_once: true
+  when: not (puc2_rehearsal_enabled | bool)
+
+- name: PUC2 2c rehearsal — fire the chain, verify it, then undo it
+  when: puc2_rehearsal_enabled | bool
+  block:
+
+    # ── Readiness (victim) ───────────────────────────────────────────────────
+    - name: Confirm the range is armed before firing
+      ansible.builtin.command: "{{ puc2_injection_root }}/inject_scenario.sh --arm"
+      register: puc2_reh_arm
+      changed_when: false
+      failed_when: puc2_arm_token not in puc2_reh_arm.stdout
+      when: inventory_hostname == 'victim'
+
+    # ── Snapshot alerts.log so the rehearsal's own alerts can be purged later ─
+    - name: Record the alerts.log size before the injection
+      ansible.builtin.stat:
+        path: "{{ puc2_rehearsal_alerts_log }}"
+      register: puc2_reh_alerts_before
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Remember the pre-injection alerts.log offset
+      ansible.builtin.set_fact:
+        puc2_reh_alerts_offset: "{{ puc2_reh_alerts_before.stat.size | default(0) }}"
+      when: inventory_hostname == 'ng-siem'
+
+    # The link checks read alerts.json, so it needs its own offset: only what is
+    # appended after this point can count as this run's evidence.
+    - name: Record the alerts.json size before the injection
+      ansible.builtin.stat:
+        path: "{{ puc2_rehearsal_alerts_json }}"
+      register: puc2_reh_alerts_json_before
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Remember the pre-injection alerts.json offset
+      ansible.builtin.set_fact:
+        puc2_reh_alerts_json_offset: "{{ puc2_reh_alerts_json_before.stat.size | default(0) }}"
+      when: inventory_hostname == 'ng-siem'
+
+    # The dashboard does not read alerts.log: Filebeat ships alerts.json to the
+    # indexer. The start of the drill, on the manager's own clock, bounds the
+    # window cleanup purges from the indexer.
+    - name: Record when the injection starts (UTC) for the indexer purge
+      ansible.builtin.command: date -u +%Y-%m-%dT%H:%M:%SZ
+      register: puc2_reh_started_at
+      changed_when: false
+      when: inventory_hostname == 'ng-siem'
+
+    # ── Snapshot CICMS so the cases the drill creates can be removed later ───
+    # Every alert this drill raises reaches DFIR-IRIS as a case, through the
+    # custom-iris integration. On 2026-09-14 12:30 cleanup left [100101],
+    # [100102] and [100103] "... on victim615" in CICMS: case_lookup.sh, the
+    # helper L14 sends trainees to, printed the L10 answer before anyone had
+    # fired anything. Worse, custom-iris deduplicates on a soc_id that is the
+    # same for every run of this scenario, so a trainee's own attack would then
+    # create no case at all, and L25's timeline would carry the drill's times.
+    # The highest case id recorded here lets cleanup remove exactly what came
+    # after it. A snapshot that cannot be taken is not a broken chain: it only
+    # means cleanup deletes nothing and the preflight gate judges what is left.
+    - name: Resolve the CICMS credentials for the case snapshot
+      ansible.builtin.include_role:
+        name: puc2_keys
+      when: inventory_hostname == 'docker-server'
+
+    - name: List the CICMS cases before the injection
+      ansible.builtin.uri:
+        url: "{{ puc2_iris_url }}/manage/cases/list"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ puc2_iris_api_key }}"
+          Content-Type: "application/json"
+        return_content: true
+        validate_certs: false
+        status_code: [200]
+        timeout: 30
+      register: puc2_reh_cases_before
+      no_log: true
+      failed_when: false
+      retries: 5
+      delay: 6
+      until: puc2_reh_cases_before.status | default(0) == 200
+      when: inventory_hostname == 'docker-server'
+
+    # Rows sit at .data or .data.data depending on the IRIS version, exactly as
+    # cicms_2c/find_case.yml handles them.
+    - name: Remember the highest CICMS case id before the injection
+      ansible.builtin.set_fact:
+        puc2_reh_case_max_id: >-
+          {{ ((puc2_reh_cases_before.json.data.data
+               | default(puc2_reh_cases_before.json.data, true)
+               | default([], true))
+              | selectattr('case_id', 'defined')
+              | map(attribute='case_id') | map('int') | list + [0]) | max }}
+      when:
+        - inventory_hostname == 'docker-server'
+        - puc2_reh_cases_before.status | default(0) == 200
+
+    # ── Fire the scenario (victim) ───────────────────────────────────────────
+    # Synchronous: the script returns after stage 4 (~3 x stage_pause seconds).
+    # Every link is polled AFTER it returns.
+    - name: Fire the malware scenario
+      ansible.builtin.command: "{{ puc2_injection_root }}/inject_scenario.sh"
+      environment:
+        STAGE_PAUSE: "{{ puc2_rehearsal_stage_pause }}"
+      register: puc2_reh_fire
+      changed_when: true
+      when: inventory_hostname == 'victim'
+
+    # ── Link 1-3: detection alerts on the manager (ng-siem) ──────────────────
+    # Poll without failing the loop (failed_when:false), then assert with an
+    # actionable message naming the exact link that never appeared.
+    #
+    # THESE FOUR CHECKS WERE UNFALSIFIABLE UNTIL 2026-09-10, in two independent
+    # ways, and the first rehearsal ever to run reported four green links on a
+    # range where the endpoint agent had never once connected:
+    #
+    #  * `grep ... | tail -1` returns TAIL's exit status, and tail always
+    #    succeeds. Asserting on `.rc == 0` therefore asserted nothing. Links 2
+    #    and 4 matched no line at all and passed anyway. Hence `set -o pipefail`
+    #    AND a criterion on stdout - either alone would do, both because an
+    #    assert that cannot fail has already cost this project three rounds.
+    #
+    #  * alerts.log is prose, so a rule id matches anywhere in the text. Links 1
+    #    and 3 matched this role's own ossec.conf edit, quoted inside the diff of
+    #    an unrelated syscheck alert. Reading alerts.json and matching the
+    #    "id":"1001xx" FIELD makes a config diff unable to forge a detection.
+    #
+    # A THIRD WAY, closed on 2026-09-14: alerts.json is never purged, so a
+    # 1001xx alert from an EARLIER run - a previous rehearsal on the same
+    # sandbox, a trainee's attempt - satisfied the grep exactly as well as one
+    # from this run. Each check now reads only the bytes appended after the
+    # offset snapshotted before the injection (tail -c +N is 1-based, hence +1).
+    # If the file is rotated mid-drill it shrinks below the offset, nothing is
+    # read and the link FAILS - the safe direction for an evidence check.
+    - name: Wait for rule 100101 (malware detected — L10)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          tail -c +{{ (puc2_reh_alerts_json_offset | int) + 1 }} {{ puc2_rehearsal_alerts_json }} \
+            | grep -a -F '"id":"100101"' | tail -1
+        executable: /bin/bash
+      register: puc2_reh_100101
+      changed_when: false
+      failed_when: false
+      until: puc2_reh_100101.stdout | default('') | length > 0
+      retries: "{{ puc2_rehearsal_alert_retries }}"
+      delay: "{{ puc2_rehearsal_alert_delay }}"
+      when: inventory_hostname == 'ng-siem'
+
+    # When 100101 is missing, say what DID arrive. On 2026-09-14 11:48 the only
+    # proof that 100100 and 100102 had fired sat inside a DFIR-IRIS case dump a
+    # thousand lines further down, and this link's message could not tell which
+    # half of the chain was alive. These counts tell the three faults apart from
+    # the log alone:
+    #   no syscheck events from an endpoint -> telemetry (agent, FIM config)
+    #   syscheck events but no 100100       -> rule 100100 (path/extension)
+    #   100100 present but no 100101        -> the hash lookup (field, CDB)
+    - name: Summarise what did alert after the injection (100101 missing)
+      ansible.builtin.shell:
+        cmd: |
+          set +e
+          since=/tmp/puc2_reh_alerts_since.json
+          tail -c +{{ (puc2_reh_alerts_json_offset | int) + 1 }} {{ puc2_rehearsal_alerts_json }} > "$since"
+          fim=$(grep -aF '"location":"syscheck"' "$since" | grep -acvF '"agent":{"id":"000"')
+          echo "syscheck events from endpoint agents since the injection: ${fim}"
+          ids=$(grep -aoE '"id":"1001[0-9]{2}"' "$since" | grep -aoE '1001[0-9]{2}' \
+            | sort | uniq -c | awk '{print $2" x"$1}' | paste -sd, -)
+          echo "PUC2 rules alerted since the injection: ${ids:-none}"
+          last=$(grep -aF '"id":"100100"' "$since" | tail -1)
+          if [ -n "$last" ]; then
+            echo "last 100100 agent: $(printf '%s' "$last" | grep -aoE '"agent":\{[^}]*\}')"
+            echo "last 100100 syscheck: $(printf '%s' "$last" | grep -aoE '"syscheck":\{[^}]*\}')"
+          fi
+          rm -f "$since"
+        executable: /bin/bash
+      register: puc2_reh_since
+      changed_when: false
+      failed_when: false
+      when:
+        - inventory_hostname == 'ng-siem'
+        - puc2_reh_100101.stdout | default('') | length == 0
+
+    - name: Assert 100101 alerted
+      ansible.builtin.assert:
+        that: puc2_reh_100101.stdout | default('') | length > 0
+        fail_msg: >-
+          LINK 1 BROKEN — rule 100101 never alerted after firing the payload
+          (training L10). What did arrive:
+          {{ puc2_reh_since.stdout | default('(not collected)') }}
+          Read it in order. No syscheck events from an endpoint: the telemetry
+          is missing (is the victim agent Active? agent_control -l on ng-siem).
+          Syscheck events but no 100100: rule 100100 did not match the path.
+          100100 present but no 100101: the hash lookup failed - rule 100101
+          must key on a FIM decoder field name (md5, never md5_after) and
+          cti-malware-hashes.cdb must carry the hash.
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Wait for rule 100102 (blocked C2 beacon)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          tail -c +{{ (puc2_reh_alerts_json_offset | int) + 1 }} {{ puc2_rehearsal_alerts_json }} \
+            | grep -a -F '"id":"100102"' | tail -1
+        executable: /bin/bash
+      register: puc2_reh_100102
+      changed_when: false
+      failed_when: false
+      until: puc2_reh_100102.stdout | default('') | length > 0
+      retries: "{{ puc2_rehearsal_alert_retries }}"
+      delay: "{{ puc2_rehearsal_alert_delay }}"
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Assert 100102 alerted
+      ansible.builtin.assert:
+        that: puc2_reh_100102.stdout | default('') | length > 0
+        fail_msg: >-
+          LINK 2 BROKEN — rule 100102 never alerted. The blocked C2 beacon is
+          not being decoded into an alert. Check the baseline egress filter on
+          victim (PUC2-FW-DROP on tcp/{{ puc2_c2_port | default(4444) }}),
+          kern.log ingestion, and rule 100102's if_sid/match.
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Wait for rule 100103 (correlated targeted attack — L11/L12)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          tail -c +{{ (puc2_reh_alerts_json_offset | int) + 1 }} {{ puc2_rehearsal_alerts_json }} \
+            | grep -a -F '"id":"100103"' | tail -1
+        executable: /bin/bash
+      register: puc2_reh_100103
+      changed_when: false
+      failed_when: false
+      until: puc2_reh_100103.stdout | default('') | length > 0
+      retries: "{{ puc2_rehearsal_alert_retries }}"
+      delay: "{{ puc2_rehearsal_alert_delay }}"
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Assert 100103 correlated
+      ansible.builtin.assert:
+        that: puc2_reh_100103.stdout | default('') | length > 0
+        fail_msg: >-
+          LINK 3 BROKEN — rule 100103 never correlated (training L11/L12). The
+          repeated-IOC correlation that confirms a targeted attack — and fires
+          containment — did not trigger. Confirm the injection is multi-stage
+          (100101 must fire more than once inside the window) and 100103's
+          frequency/timeframe/if_matched_sid.
+      when: inventory_hostname == 'ng-siem'
+
+    # ── Link 4-7: response on the endpoint (victim) ──────────────────────────
+    - name: Wait for the active response to execute (L19/L20)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          grep -a -F 'puc2-isolate' {{ puc2_rehearsal_ar_log }} | tail -1
+        executable: /bin/bash
+      register: puc2_reh_ar
+      changed_when: false
+      failed_when: false
+      until: puc2_reh_ar.stdout | default('') | length > 0
+      retries: "{{ puc2_rehearsal_marker_retries }}"
+      delay: "{{ puc2_rehearsal_marker_delay }}"
+      when: inventory_hostname == 'victim'
+
+    - name: Assert the active response ran
+      ansible.builtin.assert:
+        that: puc2_reh_ar.stdout | default('') | length > 0
+        # The message used to assert "Rule 100103 fired" unconditionally. On
+        # 2026-09-14 it had not - the manager side had stopped at LINK 1 - so the
+        # log pointed at the active-response wiring for a fault that was never
+        # there. Say what the manager side actually saw.
+        fail_msg: >-
+          {% set r103 = hostvars['ng-siem'].puc2_reh_100103 | default({}) %}
+          LINK 4 BROKEN — the puc2-isolate active response never executed on
+          victim.
+          {% if r103.stdout | default('') | length > 0 %}Rule 100103 DID fire,
+          so the manager failed to run the action: check the
+          active-response/command wiring in ng_siem_rules_2c and that
+          puc2-isolate is executable on victim.{% elif r103.attempts is defined %}Rule
+          100103 never fired (LINK 3), so nothing triggered it: fix LINK 3
+          first.{% else %}The manager side never reached the 100103 check because
+          an earlier link broke there (LINK 1-3 above): this link is a consequence
+          of that one, not a separate fault.{% endif %}
+      when: inventory_hostname == 'victim'
+
+    - name: Wait for the isolation marker to read 'isolated' (L19)
+      ansible.builtin.shell: >-
+        head -1 {{ puc2_isolation_marker }}
+      register: puc2_reh_iso
+      changed_when: false
+      failed_when: false
+      until:
+        - puc2_reh_iso.rc == 0
+        - puc2_reh_iso.stdout == puc2_isolation_status
+      retries: "{{ puc2_rehearsal_marker_retries }}"
+      delay: "{{ puc2_rehearsal_marker_delay }}"
+      when: inventory_hostname == 'victim'
+
+    - name: Assert the isolation marker is correct
+      ansible.builtin.assert:
+        that:
+          - puc2_reh_iso.rc == 0
+          - puc2_reh_iso.stdout == puc2_isolation_status
+        fail_msg: >-
+          LINK 5 BROKEN — {{ puc2_isolation_marker }} does not read
+          '{{ puc2_isolation_status }}' on its first line (training L19). Got:
+          '{{ puc2_reh_iso.stdout | default("<absent>") }}'.
+      when: inventory_hostname == 'victim'
+
+    - name: Wait for the eradication marker to read 'eradicated' (L21)
+      ansible.builtin.shell: >-
+        head -1 {{ puc2_eradication_marker }}
+      register: puc2_reh_erad
+      changed_when: false
+      failed_when: false
+      until:
+        - puc2_reh_erad.rc == 0
+        - puc2_reh_erad.stdout == puc2_eradication_status
+      retries: "{{ puc2_rehearsal_marker_retries }}"
+      delay: "{{ puc2_rehearsal_marker_delay }}"
+      when: inventory_hostname == 'victim'
+
+    - name: Assert the eradication marker is correct
+      ansible.builtin.assert:
+        that:
+          - puc2_reh_erad.rc == 0
+          - puc2_reh_erad.stdout == puc2_eradication_status
+        fail_msg: >-
+          LINK 6 BROKEN — {{ puc2_eradication_marker }} does not read
+          '{{ puc2_eradication_status }}' on its first line (training L21). Got:
+          '{{ puc2_reh_erad.stdout | default("<absent>") }}'.
+      when: inventory_hostname == 'victim'
+
+    - name: Confirm the payload was quarantined (L21)
+      ansible.builtin.find:
+        paths: "{{ puc2_quarantine_dir }}"
+        file_type: any
+      register: puc2_reh_quar
+      until: puc2_reh_quar.matched | int > 0
+      retries: "{{ puc2_rehearsal_marker_retries }}"
+      delay: "{{ puc2_rehearsal_marker_delay }}"
+      failed_when: false
+      when: inventory_hostname == 'victim'
+
+    - name: Assert the quarantine holds the payload
+      ansible.builtin.assert:
+        that: puc2_reh_quar.matched | int > 0
+        fail_msg: >-
+          LINK 7 BROKEN — {{ puc2_quarantine_dir }} is empty; the payload was
+          never quarantined (training L21).
+      when: inventory_hostname == 'victim'
+
+    - name: Record that the chain passed on this host
+      ansible.builtin.set_fact:
+        puc2_reh_chain_ok: true
+
+  rescue:
+    - name: Record that the chain failed on this host
+      ansible.builtin.set_fact:
+        puc2_reh_chain_ok: false
+        puc2_reh_failure: "{{ ansible_failed_result.msg | default('unknown failure') }}"
+
+    - name: Surface the broken link
+      ansible.builtin.debug:
+        msg: "REHEARSAL FAILED on {{ inventory_hostname }}: {{ puc2_reh_failure }}"
+
+  always:
+    # ── Cleanup — runs on pass, fail or error; leaves the range pristine ──────
+    # Undoes everything the active response applied and everything the injection
+    # dropped, so puc2_preflight (re-run at the end of this role) goes green again
+    # and the student meets a freshly provisioned range, never an attacked one.
+    - name: Roll back containment via the active response's own delete path
+      ansible.builtin.shell:
+        cmd: >-
+          echo '{"version":1,"command":"delete","parameters":{"program":"puc2-isolate"}}'
+          | /var/ossec/active-response/bin/puc2-isolate
+      register: puc2_reh_rollback
+      changed_when: true
+      failed_when: false
+      when: inventory_hostname == 'victim'
+
+    # The AR's delete path removes the 0.0.0.0 sinkhole line but does not restore
+    # the observable one; without it the arm check 'C2 domain resolves' fails.
+    - name: Restore the C2 sinkhole line provisioning seeds
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '\s{{ puc2_c2_domain | regex_escape }}$'
+        line: "{{ puc2_c2_ip }} {{ puc2_c2_domain }}"
+      when: inventory_hostname == 'victim'
+
+    - name: Empty the quarantine directory
+      ansible.builtin.shell:
+        cmd: "rm -rf {{ puc2_quarantine_dir }}/* 2>/dev/null; true"
+      changed_when: true
+      when: inventory_hostname == 'victim'
+
+    - name: Remove any payload copies the injection left behind
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ puc2_delivery_paths + ['/tmp/payload.sh', '/home/' + puc2_victim_user + '/' + 'invoice.exe'] }}"
+      when: inventory_hostname == 'victim'
+
+    - name: Remove the containment status markers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ puc2_isolation_marker }}"
+        - "{{ puc2_eradication_marker }}"
+      when: inventory_hostname == 'victim'
+
+    # The AR's delete path resets the INPUT/OUTPUT policies to ACCEPT and removes
+    # the C2 drop and the SSH rules, but it does NOT remove the six allow rules
+    # isolate_host inserted (ESTABLISHED/RELATED, loopback, sandbox CIDR). With
+    # policy ACCEPT they are functionally inert, but they are not what
+    # provisioning left, so a pristine restore deletes them explicitly. -D of a
+    # rule that is already gone errors harmlessly, hence `|| true` on each.
+    - name: Delete the allow rules isolate_host left behind
+      ansible.builtin.shell:
+        cmd: |
+          iptables -D INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+          iptables -D OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+          iptables -D INPUT  -i lo -j ACCEPT 2>/dev/null || true
+          iptables -D OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+          iptables -D INPUT  -s {{ puc2_sandbox_cidr }} -j ACCEPT 2>/dev/null || true
+          iptables -D OUTPUT -d {{ puc2_sandbox_cidr }} -j ACCEPT 2>/dev/null || true
+          true
+      changed_when: true
+      when: inventory_hostname == 'victim'
+
+    # Reassert the provisioned baseline egress filter. Its unit uses `-C` before
+    # `-I`, so a restart re-adds the tcp/{{ puc2_c2_port | default(4444) }}
+    # LOG+DROP only if it is missing and never stacks — the one firewall state
+    # the range is meant to keep. Never `iptables -F`: that would take out rules
+    # other roles own.
+    - name: Reassert the baseline egress filter
+      ansible.builtin.systemd:
+        name: puc2-fw-baseline
+        state: restarted
+      failed_when: false
+      when: inventory_hostname == 'victim'
+
+    # The AR expired the victim password (chage -d 0) and killed its sessions.
+    # Set the last-change date back to today so the account is not stuck in a
+    # forced-change state the student would trip over.
+    - name: Restore the victim account's password state
+      ansible.builtin.command: "chage -d {{ ansible_date_time.date }} {{ puc2_victim_user }}"
+      changed_when: true
+      failed_when: false
+      when: inventory_hostname == 'victim'
+
+    # Purge the rehearsal's own alerts by truncating alerts.log back to the byte
+    # offset snapshotted before the injection. This is what keeps the manager's
+    # alert view "freshly deployed": the student sees no PUC2 alerts until they
+    # fire the scenario themselves. Trade-off, acceptable pre-student: any alert
+    # any agent wrote during the rehearsal window is dropped too. The byte count
+    # removed is recorded for the report.
+    #
+    # alerts.json is deliberately NOT truncated the same way. Filebeat ships it
+    # to the indexer - confirmed on 2026-09-14 14:44 by the preflight probe:
+    # filebeat active, output wazuh-indexer.mini.ngsiem.sph.gr:9200 over https -
+    # and Filebeat tracks a byte offset, so a file that shrinks under it would be
+    # read again from the start and every earlier alert indexed twice. The
+    # drill's alerts are removed from the indexer itself instead (below), and
+    # the link checks only read past their own offset anyway.
+    - name: Measure alerts.log before the purge
+      ansible.builtin.stat:
+        path: "{{ puc2_rehearsal_alerts_log }}"
+      register: puc2_reh_alerts_after
+      when: inventory_hostname == 'ng-siem'
+
+    - name: Truncate alerts.log back to its pre-rehearsal size
+      ansible.builtin.command: >-
+        truncate -s {{ puc2_reh_alerts_offset | default(0) }} {{ puc2_rehearsal_alerts_log }}
+      register: puc2_reh_alerts_purged
+      changed_when: true
+      failed_when: false
+      when:
+        - inventory_hostname == 'ng-siem'
+        - puc2_reh_alerts_after.stat.size | default(0) | int > puc2_reh_alerts_offset | default(0) | int
+
+    - name: Record how many bytes of rehearsal alerts were purged
+      ansible.builtin.set_fact:
+        puc2_reh_alerts_purged_bytes: >-
+          {{ (puc2_reh_alerts_after.stat.size | default(0) | int)
+             - (puc2_reh_alerts_offset | default(0) | int) }}
+      when: inventory_hostname == 'ng-siem'
+
+    # ── Indexer: remove the drill's alerts from what the dashboard reads ─────
+    # Truncating alerts.log cleans the console path only. On 2026-09-14 14:44,
+    # after cleanup, the indexer still held 14 alerts for rules 100100-100103:
+    # L10's hint ("filter the dashboard by rule.id 1001*") showed the answer
+    # before the trainee fired anything, and L8/L11/L25 showed the drill's
+    # events and times. The indexer admin certificate on this host answers
+    # (HTTP 200 in that run), so no credential has to be handled.
+    #
+    # Filebeat ships asynchronously, so first wait until the indexer holds at
+    # least as many 1001xx alerts as alerts.json gained since the offset -
+    # purging earlier would leave the stragglers behind. Then delete, inside the
+    # drill's window, every alert from the victim agent or for a PUC2 rule, and
+    # count again. Same trade-off as alerts.log: anything else that agent raised
+    # in the window goes too. No certificate, or no answer, means nothing is
+    # deleted and the report says so; the ng-siem preflight gate then fails the
+    # build if PUC2 alerts remain.
+    - name: Purge the drill's alerts from the indexer the dashboard reads
+      ansible.builtin.shell:
+        cmd: |
+          {% set agent_id = ((hostvars['victim'].puc2_agent_id | default({})).stdout | default('')) | trim %}
+          set +e
+          IDX="https://127.0.0.1:9200/wazuh-alerts-*"
+          CERT="{{ puc2_rehearsal_indexer_cert }}"
+          KEY="{{ puc2_rehearsal_indexer_key }}"
+          if [ ! -r "$CERT" ] || [ ! -r "$KEY" ]; then
+            echo "SKIPPED=no readable indexer admin certificate at $CERT"
+            exit 0
+          fi
+          WINDOW='{ "range": { "timestamp": { "gte": "{{ puc2_reh_started_at.stdout }}" } } }'
+          PUC2='{ "terms": { "rule.id": [ "100100", "100101", "100102", "100103" ] } }'
+          COUNT_BODY="{ \"query\": { \"bool\": { \"filter\": [ $WINDOW, $PUC2 ] } } }"
+          AGENT='{% if agent_id %}, { "term": { "agent.id": "{{ agent_id }}" } }{% endif %}'
+          PURGE_BODY="{ \"query\": { \"bool\": { \"filter\": [ $WINDOW ],
+            \"should\": [ $PUC2$AGENT ], \"minimum_should_match\": 1 } } }"
+          idx() { curl -sk --max-time 60 --cert "$CERT" --key "$KEY" -H 'Content-Type: application/json' "$@"; }
+          count_puc2() { idx -X POST "$IDX/_count" -d "$COUNT_BODY" | grep -oE '"count":[0-9]+' | head -1 | cut -d: -f2; }
+
+          expected=$(tail -c +{{ (puc2_reh_alerts_json_offset | int) + 1 }} {{ puc2_rehearsal_alerts_json }} \
+            | grep -acE '"id":"1001(00|01|02|03)"')
+          indexed=""
+          for i in $(seq 1 {{ puc2_rehearsal_indexer_settle_tries }}); do
+            indexed=$(count_puc2)
+            [ -n "$indexed" ] && [ "$indexed" -ge "${expected:-0}" ] && break
+            sleep {{ puc2_rehearsal_indexer_settle_delay }}
+          done
+          echo "EXPECTED_IN_ALERTS_JSON=${expected:-0}"
+          echo "INDEXED_BEFORE_PURGE=${indexed:-unanswered}"
+          if [ -z "$indexed" ]; then
+            echo "SKIPPED=the indexer did not answer the count"
+            exit 0
+          fi
+          # What the purge will actually remove: the PUC2 alerts above plus every
+          # other alert the victim agent raised in the window. On 2026-09-14 15:26
+          # DELETED=134 stood next to 14 PUC2 alerts with nothing to reconcile them.
+          all=$(idx -X POST "$IDX/_count" -d "$PURGE_BODY" | grep -oE '"count":[0-9]+' | head -1 | cut -d: -f2)
+          echo "ALL_MATCHING_BEFORE_PURGE=${all:-unanswered}"
+
+          deleted=0
+          remaining=""
+          for pass in 1 2 3; do
+            resp=$(idx -X POST "$IDX/_delete_by_query?conflicts=proceed&refresh=true" -d "$PURGE_BODY")
+            d=$(printf '%s' "$resp" | grep -oE '"deleted":[0-9]+' | head -1 | cut -d: -f2)
+            [ -z "$d" ] && echo "UNEXPECTED_RESPONSE=$(printf '%s' "$resp" | head -c 300)"
+            deleted=$((deleted + ${d:-0}))
+            remaining=$(count_puc2)
+            [ "$remaining" = "0" ] && break
+            sleep 10
+          done
+          echo "DELETED=$deleted"
+          echo "PUC2_REMAINING=${remaining:-unanswered}"
+        executable: /bin/bash
+      register: puc2_reh_indexer_purge
+      changed_when: puc2_reh_indexer_purge.stdout | default('') is search('DELETED=[1-9]')
+      failed_when: false
+      when:
+        - inventory_hostname == 'ng-siem'
+        - puc2_reh_started_at.stdout is defined
+
+    # ── CICMS: remove the cases this drill made custom-iris create ───────────
+    # integratord posts each alert to IRIS within seconds, so the last ones are
+    # given time to land before listing. A case raised later still (the active
+    # response's background update run can raise dpkg alerts minutes on) would
+    # survive; such cases carry no graded answer, and the preflight gate fails
+    # the build if any PUC2 rule case is left behind.
+    - name: Let custom-iris finish posting the drill's alerts
+      ansible.builtin.wait_for:
+        timeout: "{{ puc2_rehearsal_case_settle }}"
+      when:
+        - inventory_hostname == 'docker-server'
+        - puc2_reh_case_max_id is defined
+
+    - name: List the CICMS cases after the drill
+      ansible.builtin.uri:
+        url: "{{ puc2_iris_url }}/manage/cases/list"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ puc2_iris_api_key }}"
+          Content-Type: "application/json"
+        return_content: true
+        validate_certs: false
+        status_code: [200]
+        timeout: 30
+      register: puc2_reh_cases_after
+      no_log: true
+      failed_when: false
+      retries: 5
+      delay: 6
+      until: puc2_reh_cases_after.status | default(0) == 200
+      when:
+        - inventory_hostname == 'docker-server'
+        - puc2_reh_case_max_id is defined
+
+    # Ids as a comma-joined STRING, not a list: a folded-scalar set_fact is not
+    # guaranteed to hand back a native list (see puc2_preflight/tasks/ng_siem.yml).
+    - name: Pick the cases created after the snapshot
+      ansible.builtin.set_fact:
+        puc2_reh_new_case_ids: >-
+          {{ (puc2_reh_cases_after.json.data.data
+              | default(puc2_reh_cases_after.json.data, true)
+              | default([], true))
+             | selectattr('case_id', 'defined')
+             | selectattr('case_id', 'gt', puc2_reh_case_max_id | int)
+             | map(attribute='case_id') | map('string') | join(',') }}
+      when:
+        - inventory_hostname == 'docker-server'
+        - puc2_reh_case_max_id is defined
+        - puc2_reh_cases_after.status | default(0) == 200
+
+    # POST /manage/cases/delete/<id> is the route in iris-web v2.4.29 and on
+    # master alike (blueprints manage_cases_routes.py).
+    - name: Delete the cases the drill created
+      ansible.builtin.uri:
+        url: "{{ puc2_iris_url }}/manage/cases/delete/{{ item }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ puc2_iris_api_key }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: {}
+        return_content: true
+        validate_certs: false
+        status_code: [200]
+        timeout: 60
+      loop: "{{ (puc2_reh_new_case_ids | default('')).split(',') | select | list }}"
+      register: puc2_reh_case_delete
+      no_log: true
+      failed_when: false
+      when: inventory_hostname == 'docker-server'
+
+    - name: Count the CICMS cases actually deleted
+      ansible.builtin.set_fact:
+        puc2_reh_cases_targeted: "{{ (puc2_reh_new_case_ids | default('')).split(',') | select | list | length }}"
+        puc2_reh_cases_deleted: >-
+          {{ puc2_reh_case_delete.results | default([])
+             | selectattr('status', 'defined') | selectattr('status', 'equalto', 200)
+             | list | length }}
+      when: inventory_hostname == 'docker-server'
+
+    # One message per host, saying what was done THERE. This used to print the
+    # victim's containment rollback for every host that was not ng-siem, so the
+    # log claimed a quarantine had been emptied on docker-server.
+    - name: Report the cleanup outcome
+      ansible.builtin.debug:
+        msg: >-
+          Cleanup done on {{ inventory_hostname }}.
+          {% if inventory_hostname == 'ng-siem' %}Purged
+          {{ puc2_reh_alerts_purged_bytes | default(0) }} bytes of rehearsal
+          alerts from alerts.log; indexer:
+          {{ (puc2_reh_indexer_purge.stdout_lines | default(['purge not run'], true)) | join(', ') }}.
+          {%- elif inventory_hostname == 'docker-server' %}{% if puc2_reh_case_max_id is defined %}Deleted
+          {{ puc2_reh_cases_deleted | default(0) }} of
+          {{ puc2_reh_cases_targeted | default(0) }} CICMS case(s) created after
+          case id {{ puc2_reh_case_max_id }}
+          ({{ puc2_reh_new_case_ids | default('') or 'none' }}).{% else %}CICMS
+          was not snapshotted before the drill, so no case was deleted; the
+          preflight gate reports any PUC2 case left behind.{% endif %}{% else %}Containment
+          rolled back, sinkhole and baseline restored, quarantine emptied,
+          markers removed.{% endif %}
+
+  # ── Report — written once, from the controller, before anything can fail ────
+  # Evidence is split across hosts (alert lines on ng-siem, markers on victim),
+  # so the template reads both out of hostvars. Written before the preflight
+  # re-run so the report survives even if that re-run trips.
+  # The report is EVIDENCE, not a verdict, and it is written to the controller's
+  # own checkout — which on the CyberRangeCZ runner is a throwaway clone under
+  # /app/ansible_repo that nobody reads afterwards, and which may be read-only.
+  # Now that this role gates every build, a controller that cannot take the file
+  # must not be able to sink a range whose chain actually passed. The verdict
+  # below is what fails the deployment; this only records the detail.
+- name: Write the rehearsal report
+  ansible.builtin.template:
+    src: REHEARSAL_REPORT.md.j2
+    dest: "{{ playbook_dir }}/../validation/REHEARSAL_REPORT.md"
+    mode: '0644'
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: puc2_reh_report
+  # ignore_errors, NOT failed_when:false — the latter rewrites `failed` to false,
+  # which would make the notice below unreachable and the miss silent.
+  ignore_errors: true
+  when: puc2_rehearsal_enabled | bool
+
+- name: Note that the rehearsal report could not be written
+  ansible.builtin.debug:
+    msg: >-
+      Rehearsal report NOT written to validation/REHEARSAL_REPORT.md
+      ({{ puc2_reh_report.msg | default('unknown reason') }}). The verdict below
+      is unaffected — every link's evidence is in this deployment log.
+  run_once: true
+  when:
+    - puc2_rehearsal_enabled | bool
+    - puc2_reh_report.failed | default(false)
+
+  # ── Re-prove the range is back to a handover-ready state ────────────────────
+  # Criterion (3): cleanup must leave puc2_preflight green again. Running it here
+  # rather than trusting the cleanup makes that a verified fact — and if anything
+  # was not restored, this fails loudly, on the host where it is wrong.
+  #
+  # Skipped when the drill is: the preflight play runs immediately after this one
+  # anyway, so re-including it here would only double a gate that already ran.
+- name: Re-prove the preflight gate after the rehearsal
+  ansible.builtin.include_role:
+    name: puc2_preflight
+  when: puc2_rehearsal_enabled | bool
+
+  # ── Signal the rehearsal's own verdict ──────────────────────────────────────
+  # Cleanup and the report are done; now fail non-zero if any link broke, so a
+  # broken chain is never a silently green run. The report names which link.
+  #
+  # `default(false)` is the correct reading for a host that never recorded a
+  # verdict — but ONLY while the drill ran. With the drill skipped no host records
+  # anything, so this must be skipped too or turning the kill switch on would fail
+  # every deployment for the crime of being switched off.
+- name: Fail if any link of the chain broke
+  ansible.builtin.assert:
+    that:
+      - hostvars['ng-siem'].puc2_reh_chain_ok | default(false)
+      - hostvars['victim'].puc2_reh_chain_ok | default(false)
+    fail_msg: >-
+      Rehearsal FAILED — a link of the detection/response chain broke. See
+      validation/REHEARSAL_REPORT.md for which one and the overlay to fix, or
+      the LINK n BROKEN message earlier in this log. The range was still
+      restored and preflight re-run.
+    success_msg: >-
+      Rehearsal PASSED — 100101 -> 100102 -> 100103 -> active response ->
+      markers -> quarantine all confirmed in runtime, range restored, preflight
+      green.
+  run_once: true
+  delegate_to: localhost
+  when: puc2_rehearsal_enabled | bool

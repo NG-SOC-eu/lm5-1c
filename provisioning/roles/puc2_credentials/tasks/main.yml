@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# role: puc2_credentials   (host: docker-server — where the .env secrets live)
+#
+# Leaves the SOC dashboard credentials in a 0600 root file inside the sandbox,
+# so L1 can point trainees at it instead of "ask your instructor", and so no
+# password ever enters the repo or the training JSON. The generator reads the
+# .env on this node and writes the file itself; secrets never transit an Ansible
+# variable or the log.
+# =============================================================================
+
+- name: Ensure the credentials directory exists
+  ansible.builtin.file:
+    path: "{{ puc2_cred_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Deploy the credentials generator
+  ansible.builtin.template:
+    src: make_credentials.sh.j2
+    dest: "{{ puc2_cred_dir }}/make_credentials.sh"
+    owner: root
+    group: root
+    mode: '0750'
+
+# DELIBERATELY NOT no_log. It was, and that was a mistake: this task failed on a
+# real deployment and the log said only "the output has been hidden due to the
+# fact that 'no_log: true' was specified", so the one thing needed to diagnose it
+# was the one thing hidden. no_log belongs on tasks whose ARGUMENTS carry a
+# secret; this one's do not — the script reads the .env itself and writes the
+# values straight into the 0600 file, printing only "wrote <path>". Keeping the
+# failure readable is worth more than hiding a line that carries nothing.
+- name: Generate the credentials file from the deployed .env files
+  ansible.builtin.command: "{{ puc2_cred_dir }}/make_credentials.sh"
+  register: puc2_cred_run
+  changed_when: true
+
+- name: Confirm the credentials file exists with 0600 permissions
+  ansible.builtin.stat:
+    path: "{{ puc2_cred_file }}"
+  register: puc2_cred_stat
+
+- name: FAIL if the credentials file is missing or not 0600
+  ansible.builtin.assert:
+    that:
+      - puc2_cred_stat.stat.exists
+      - puc2_cred_stat.stat.mode == '0600'
+      - puc2_cred_stat.stat.pw_name == 'root'
+    fail_msg: >-
+      {{ puc2_cred_file }} was not produced as a 0600 root file
+      (exists={{ puc2_cred_stat.stat.exists | default(false) }},
+      mode={{ puc2_cred_stat.stat.mode | default('?') }}).
+    success_msg: >-
+      Credentials published at {{ puc2_cred_file }} (0600 root). Trainees read it
+      with `sudo cat {{ puc2_cred_file }}` on docker-server; no secret is in the
+      repo or the training JSON.

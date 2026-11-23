@@ -1,0 +1,50 @@
+name: testing
+hosts:
+  - name: kali
+    base_box:
+      image: kali
+      mgmt_user: debian
+    flavor: standard.xmedium
+  - name: docker-server
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: standard.xmedium
+  - name: ng-siem
+    base_box:
+      image: siemng
+      mgmt_user: ubuntu
+    flavor: standard.ngsiem
+  - name: victim
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: standard.small
+routers: 
+  - name: router
+    base_box:
+      image: debian-12-x86_64
+      mgmt_user: debian
+    flavor: standard.small
+networks:
+  - name: testnet
+    cidr: 10.0.16.0/24
+    accessible_by_user: true
+net_mappings:
+  - host: kali
+    network: testnet
+    ip: 10.0.16.50
+  - host: docker-server
+    network: testnet
+    ip: 10.0.16.60
+  - host: victim
+    network: testnet
+    ip: 10.0.16.100
+  - host: ng-siem
+    network: testnet
+    ip: 10.0.16.70
+router_mappings: 
+  - router: router
+    network: testnet
+    ip: 10.0.16.1
+groups: []

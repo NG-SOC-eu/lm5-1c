@@ -1,0 +1,273 @@
+---
+# =============================================================================
+# role: cicms_2c        (host: docker-server — runs AFTER the docker_server role)
+#
+# ADDITIVE OVERLAY. DFIR-IRIS itself, its MISP module and its NG-SOAR webhook
+# (http://<docker-server>:8080/trigger/playbook) are all deployed and wired by
+# the substrate's docker_server role — none of that is recreated here.
+#
+# The incident CASE is created automatically at alert time by the substrate's
+# custom-iris integration on ng-siem (with dedup by case_soc_id). This role
+# only registers the Sub Case 2c CASE TEMPLATE, so the analyst gets the right
+# task list and briefing notes on that case.
+#
+# UML coverage:
+#   step 7 - incident case opened with the SIEM context attached
+#   step 8 - the case's enrichment task pointing at CTI-SS (MISP)
+# =============================================================================
+
+# Elects the key from the host that runs DFIR-IRIS — the database, where
+# docker_server itself goes when the hardcoded key is rejected — and proves the
+# service accepts it, so this role and the preflight gate hold the same key.
+- name: Resolve and prove the CICMS credential
+  ansible.builtin.include_role:
+    name: puc2_keys
+
+- name: Create the CICMS assets directory
+  ansible.builtin.file:
+    path: "{{ puc2_iris_assets_dir }}"
+    state: directory
+    mode: '0755'
+
+# Kept on disk as the human-readable record of what was registered.
+- name: Render the PUC2 2c case template
+  ansible.builtin.template:
+    src: case_template_puc2.json.j2
+    dest: "{{ puc2_iris_assets_dir }}/case_template_puc2.json"
+    mode: '0644'
+
+# The registration request itself, rendered to a file and POSTed from it. The
+# registration task below explains why the body cannot be built inline.
+- name: Render the PUC2 2c case-template registration request
+  ansible.builtin.template:
+    src: case_template_request.json.j2
+    dest: "{{ puc2_iris_assets_dir }}/case_template_request.json"
+    mode: '0644'
+
+# puc2_keys has already proved /api/ping answers 200 with the elected key, which
+# is what the old wait-loop was for.
+
+# ── Register the case template (UML steps 7-8) ───────────────────────────────
+# `return_content: true` throughout: ansible.builtin.uri omits `content`
+# without it, so every `X not in (result.content | default(''))` guard below
+# was testing against the empty string and re-creating on every run.
+- name: List the case templates already registered in CICMS
+  ansible.builtin.uri:
+    url: "{{ puc2_iris_url }}/manage/case-templates/list"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ puc2_iris_api_key }}"
+      Content-Type: "application/json"
+    return_content: true
+    validate_certs: false
+    status_code: [200]
+    timeout: 30
+  register: puc2_iris_templates
+  no_log: true
+  retries: 10
+  delay: 6
+  until: puc2_iris_templates.status | default(0) == 200
+  # Cosmetic path: never fatal. If the listing cannot be had we simply attempt
+  # the registration and let that report for itself. Whether IRIS is healthy
+  # enough for the things the trainee DOES need is decided further down, by the
+  # case creation, and finally by the gate.
+  failed_when: false
+
+- name: Register the PUC2 2c case template in CICMS
+  ansible.builtin.uri:
+    url: "{{ puc2_iris_url }}/manage/case-templates/add"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ puc2_iris_api_key }}"
+      Content-Type: "application/json"
+    # POSTED FROM A FILE, NEVER BUILT INLINE. IRIS does json.loads() on the
+    # case_template_json field, so it must arrive as a JSON *string*. Ansible
+    # 2.16 keeps turning JSON-looking text into data: with convert_data=True
+    # (the default for task arguments and for the template lookup) a rendered
+    # value that starts with '{' goes through ast.literal_eval. Both builds so far
+    # were refused for that reason:
+    #   inline body (to 2026-09-14): "the JSON object must be str ... not dict"
+    #   lookup | trim (2026-09-15):  "Expecting property name enclosed in
+    #                                 double quotes: line 1 column 2" - the
+    #                                 dict's Python repr, single quotes
+    # case_template_request.json.j2 now reads the template with
+    # convert_data=False and serialises the body with to_json. uri sends that
+    # file untouched with src=. Reproduced and verified with ansible-core
+    # 2.16.14, jinja2_native off (the runner has no ansible.cfg) and on.
+    src: "{{ puc2_iris_assets_dir }}/case_template_request.json"
+    remote_src: true
+    return_content: true
+    validate_certs: false
+    status_code: [200, 201]
+    timeout: 30
+  register: puc2_iris_template_add
+  no_log: true
+  # DFIR-IRIS answers 200 with {"status": "error", ...}; the status line alone
+  # cannot tell a registration from a refusal, so `changed` has to read the body.
+  changed_when: >-
+    puc2_iris_template_add.status | default(0) in [200, 201]
+    and (puc2_iris_template_add.json | default({})).status | default('') != 'error'
+  # NEVER FATAL — this is the whole point of the change.
+  #
+  # This template is decorative: the training definition does not mention
+  # PUC2-2C-Malware anywhere, and no level is graded on it. It used to be fatal,
+  # so IRIS refusing the document aborted the play — which skipped the task that
+  # creates CASE-PUC2-2C, the SOC id level 7 grades, and skipped the preflight
+  # gate entirely, so nothing was left to report what was missing. A trainee
+  # would have reached level 7 to find no case, with a green-looking cause
+  # buried in a task nobody needed.
+  #
+  # A cosmetic resource does not get to decide whether the range ships. What the
+  # trainee actually needs fails hard, in the gate, by name.
+  failed_when: false
+  when: "'PUC2-2C-Malware' not in (puc2_iris_templates.content | default(''))"
+
+# `changed` is inferred from the response body, and a body can lie by omission.
+# Now that the registration can actually succeed, ask IRIS what it holds rather
+# than trusting what it said — the previous version reported its own POST and
+# never once looked. Still not fatal: this template is cosmetic by design, and a
+# cosmetic resource does not get to decide whether the range ships.
+- name: Ask CICMS whether the template is registered now
+  ansible.builtin.uri:
+    url: "{{ puc2_iris_url }}/manage/case-templates/list"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ puc2_iris_api_key }}"
+      Content-Type: "application/json"
+    return_content: true
+    validate_certs: false
+    status_code: [200]
+    timeout: 30
+  register: puc2_iris_templates_after
+  no_log: true
+  failed_when: false
+  when: puc2_iris_template_add is not skipped
+
+- name: Record whether the template is present in CICMS
+  ansible.builtin.set_fact:
+    puc2_template_present: >-
+      {{ 'PUC2-2C-Malware' in (puc2_iris_templates_after.content
+         | default(puc2_iris_templates.content | default(''))) }}
+
+# `no_log` above hides the request, which carries the bearer token. The RESPONSE
+# body carries no credential, so it can be surfaced — and it must be, or the
+# next schema refusal is as silent as this one was. The reason arrives in the
+# build log by itself, with nobody toggling no_log to go looking for it.
+- name: Report the case-template registration outcome
+  ansible.builtin.debug:
+    msg: >-
+      {% if puc2_iris_template_add is skipped %}
+      CICMS case template 'PUC2-2C-Malware' already registered — nothing to do.
+      {% elif puc2_template_present | bool %}
+      CICMS case template 'PUC2-2C-Malware' registered — confirmed present in
+      IRIS's own template list, not merely accepted by the POST.
+      {% else %}
+      CICMS case template NOT registered — HTTP
+      {{ puc2_iris_template_add.status | default('unreachable') }},
+      IRIS said: {{ (puc2_iris_template_add.json | default({})).message
+                    | default('(no message in the response body)') }}
+      {{ (puc2_iris_template_add.json | default({})).data | default('') }}.
+      THIS DOES NOT AFFECT ANY TRAINING LEVEL — the template is cosmetic and no
+      level is graded on it. Deployment continues; the resources trainees do
+      need are verified by the puc2_preflight gate at the end of this run.
+      {% endif %}
+
+# ── The scenario case (UML step 7, training level L14) ───────────────────────
+# Training L14 grades the case SOC id, which must be exactly
+# {{ puc2_case_soc_id }}. The substrate's custom-iris integration builds its own
+# ids (WAZUH-<rule>-<ip>-<user>-<hash>) and IS NOT OURS TO EDIT, so the scenario
+# case is created here at provision time instead. custom-iris keeps adding its
+# own alert-derived cases alongside; both are expected in the IRIS case list.
+- name: Check whether the scenario case already exists in CICMS
+  ansible.builtin.include_tasks: find_case.yml
+
+- name: Create the PUC2 2c scenario case
+  ansible.builtin.uri:
+    url: "{{ puc2_iris_url }}/manage/cases/add"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ puc2_iris_api_key }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      case_soc_id: "{{ puc2_case_soc_id }}"
+      case_customer: 1
+      case_name: "[PUC2-2C] Malware attack on the lab endpoint"
+      case_description: >-
+        Scenario case for PUC2 (CYNET) Sub Case 2c. NG-SIEM context: rules
+        100101/100103 on agent victim ({{ puc2_victim_ip }}), manager
+        {{ puc2_ng_siem_ip }}. Enrichment from CTI-SS at {{ puc2_misp_url }}.
+      severity_id: "4"
+      case_tags: "puc2-2c,malware,{{ puc2_mitre_initial_access }},{{ puc2_mitre_execution }}"
+    return_content: true
+    validate_certs: false
+    status_code: [200, 201]
+    timeout: 30
+  register: puc2_case_create
+  no_log: true
+  changed_when: puc2_case_create.status in [200, 201]
+  # A 200 from DFIR-IRIS is not a created case: it answers 200 with
+  # {"status": "error"} for a duplicate SOC id, a bad customer id or a
+  # validation failure. The case is only real if the response carries its id.
+  failed_when: >-
+    puc2_case_create.status not in [200, 201]
+    or (puc2_case_create.json | default({})).status | default('') == 'error'
+    or ((puc2_case_create.json | default({})).data | default({})).case_id is not defined
+  when: not puc2_case_found
+
+# Read the case back from the service — by its SOC id — rather than believing
+# the create. This is training level L14's answer; if it is not there the
+# deployment stops, because a trainee finding out instead is the failure this
+# whole gate exists to prevent.
+- name: Confirm the scenario case is now in CICMS
+  ansible.builtin.include_tasks: find_case.yml
+
+- name: FAIL if the scenario case is absent from CICMS
+  ansible.builtin.assert:
+    that:
+      - puc2_case_found
+    fail_msg: >-
+      Case {{ puc2_case_soc_id }} is absent from CICMS after provisioning.
+      Lookup: {{ puc2_case_lookup }}.
+      Create attempt: HTTP {{ puc2_case_create.status | default('skipped') }},
+      case id returned:
+      {{ ((puc2_case_create.json | default({})).data | default({})).case_id | default('none') }}.
+      Training level L14 grades this exact SOC id and would be unanswerable.
+      Diagnose with:
+      `ansible-playbook provisioning/playbook.yml --tags puc2_diag --limit docker-server`
+    success_msg: >-
+      Case {{ puc2_case_soc_id }} present in CICMS
+      (id {{ puc2_case_found_id }}, matched by {{ puc2_case_lookup }}).
+
+# ── Operator-driven case opening (UML step 7) ────────────────────────────────
+- name: Ensure jq is available for the operator helper scripts
+  ansible.builtin.apt:
+    name: jq
+    state: present
+    update_cache: false
+
+- name: Deploy the NG-SOC Operator case-opening helper
+  ansible.builtin.template:
+    src: open_case.sh.j2
+    dest: "{{ puc2_iris_assets_dir }}/open_case.sh"
+    mode: '0750'
+  no_log: true
+
+# The console path for L14 (scenario case SOC id), read-only, alongside
+# open_case.sh in the same operator-helper directory. no_log because the
+# rendered file carries the IRIS API key.
+- name: Deploy the CICMS console case-lookup helper (L14)
+  ansible.builtin.template:
+    src: case_lookup.sh.j2
+    dest: "{{ puc2_iris_assets_dir }}/case_lookup.sh"
+    mode: '0750'
+  no_log: true
+
+- name: Report the CICMS registration outcome
+  ansible.builtin.debug:
+    msg: >-
+      CICMS (DFIR-IRIS) at {{ puc2_iris_url }}:
+      scenario case {{ puc2_case_soc_id }} present as id {{ puc2_case_found_id }}
+      ({{ puc2_case_lookup }}).
+      The substrate custom-iris integration keeps adding its own alert-derived
+      cases alongside; containment is orchestrated via {{ puc2_soar_webhook_url }}.

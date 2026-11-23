@@ -1,0 +1,1860 @@
+---
+- name: Set password on User ubuntu
+  ansible.builtin.user:
+    name: ubuntu
+    # Sourced from ansible-vault. omit = leave the account password alone when
+    # none is provided, rather than setting an empty one. The literal that used
+    # to be here is public on GitHub: see validation/SECURITY_ROTATION.md.
+    password: "{{ vault_ubuntu_password_hash | default(omit) }}"
+    update_password: always
+  no_log: true
+
+- name: Save docker-server internal (topology) IP fact
+  ansible.builtin.set_fact:
+    docker_server_internal_ip: "{{ ansible_all_ipv4_addresses | select('match', '^10\\.') | first }}"
+    cacheable: yes
+
+- name: Install Docker prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - smbclient
+      - cifs-utils
+      - unzip
+    state: present
+    update_cache: yes
+
+- name: Create /etc/apt/keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: '0644'
+
+- name: Add Docker APT repository
+  ansible.builtin.shell: |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  args:
+    creates: /etc/apt/sources.list.d/docker.list
+  register: repo_add
+  changed_when: repo_add.rc == 0
+
+- name: Update APT cache after adding repository
+  ansible.builtin.apt:
+    update_cache: yes
+
+- name: Install Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: yes
+
+- name: Ensure Docker service is started and enabled
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Create mount point
+  ansible.builtin.file:
+    path: "/mnt/smb_shared"
+    state: directory
+    mode: "0775"
+    
+- name: Mount SMB Share (guest)
+  ansible.builtin.mount:
+    src: "//10.250.232.198/shared"
+    path: "/mnt/smb_shared"
+    fstype: cifs
+    opts: "guest,vers=3.0"
+    state: mounted
+
+- name: Copy RITA zip from SMB to destination
+  ansible.builtin.copy:
+    src: "/mnt/smb_shared/rita-docker.zip"
+    dest: "/opt/rita-docker.zip"
+    remote_src: true
+    mode: "0644"
+  when: puc2_deploy_rita | default(false) | bool
+
+- name: Copy DFIR-IRIS zip from SMB to destination
+  copy:
+    src: "/mnt/smb_shared/dfir-iris-custom.zip"
+    dest: "/opt/dfir-iris-custom.zip"
+    remote_src: true
+    mode: "0644"
+  register: iris_bundle_copy
+
+# The IRIS bundle comes from the SMB share, outside this repo, and can change
+# between deploys without a commit here. When IRIS breaks in a way no commit
+# explains (2026-10-11: nginx exiting on start), the first question is whether
+# the bundle changed - and no earlier log kept its checksum to compare against.
+# Reference, from the 2026-10-11 15:07 deploy - the NEW bundle (nginx "8080:80",
+# worker "app:8000"), on the share since about 2026-10-07: sha1
+# 061bfacf2bb3ec4d0bb221332b29b005c46b2187, md5 d8913efbd84ad8ecf3762ca689032ca9,
+# 15109320 bytes. (copy reports md5sum only when it actually copies; the sha1
+# checksum is always there.)
+- name: Record which DFIR-IRIS bundle this deploy uses
+  ansible.builtin.debug:
+    msg: >-
+      DFIR-IRIS bundle: sha1 {{ iris_bundle_copy.checksum | default('?') }},
+      md5 {{ iris_bundle_copy.md5sum | default('(not reported, unchanged copy)') }},
+      {{ iris_bundle_copy.size | default('?') }} bytes, from
+      /mnt/smb_shared/dfir-iris-custom.zip. Compare with the previous deploy's
+      log when IRIS behaves differently.
+
+- name: Create NG-SOAR directory for the yml
+  file:
+    path: "/opt/NG-SOAR"
+    state: directory
+    mode: "0755"
+
+- name: Create MISP directory for the git repo
+  file:
+    path: "/opt/misp-docker"
+    state: directory
+    mode: "0755"
+
+- name: Copy NG-SOAR yml from SMB to destination
+  copy:
+    src: "/mnt/smb_shared/NG-SOAR.yml"
+    dest: "/opt/NG-SOAR/docker-compose.yml"
+    remote_src: true
+    mode: "0644"
+
+- name: Unarchive RITA Docker bundle
+  ansible.builtin.unarchive:
+    src: "/opt/rita-docker.zip"
+    dest: "/opt/"
+    remote_src: true
+    extra_opts: ["-o"]
+  when: puc2_deploy_rita | default(false) | bool
+
+- name: Unzip rita frontend dist.zip
+  ansible.builtin.unarchive:
+    src: "/opt/rita-docker/frontend-container/rita-frontend/dist.zip"
+    dest: "/opt/rita-docker/frontend-container/rita-frontend"
+    remote_src: true
+    extra_opts: ["-o"]
+  when: puc2_deploy_rita | default(false) | bool
+
+- name: Unzip DFIR-IRIS Docker
+  unarchive:
+    src: "/opt/dfir-iris-custom.zip"
+    dest: "/opt/"
+    remote_src: true
+    extra_opts: ["-o"]
+
+- name: Ensure RITA Docker network exists
+  community.docker.docker_network:
+    name: rita-network
+    state: present
+  when: puc2_deploy_rita | default(false) | bool
+
+#- name: Ensure NG-SOAR network exists
+#  community.docker.docker_network:
+#    name: db-net
+#    state: present
+
+# Authenticated pulls only raise the Docker Hub rate limit; they are not required.
+# With no PAT in vault this is skipped and images are pulled anonymously, which is
+# why it is guarded rather than left to fail on an empty password. The literal PAT
+# that used to be here is public on GitHub: see validation/SECURITY_ROTATION.md.
+- name: Login to Docker Hub
+  community.docker.docker_login:
+    username: "{{ vault_dockerhub_user | default('') }}"
+    password: "{{ vault_dockerhub_pat | default('') }}"
+  when: (vault_dockerhub_pat | default('')) | length > 0
+  no_log: true
+
+# Anonymous pulls are rate-limited, and on this range that limit is reached: a
+# deployment with no PAT fails later, deep inside a docker compose task, with a
+# raw 429 on an image like rabbitmq that says nothing about the skipped login.
+# This says it up front. It warns rather than fails because anonymous pulls do
+# succeed when the limit has not been hit (cached images, a fresh egress IP).
+# ── Fall back to the substrate's published credential ────────────────────────
+# Only when no PAT was supplied. See defaults/main.yml for what this credential
+# is, why it is read at deploy time instead of stored here, and what it costs.
+#
+# The secret is fetched, piped into `docker login --password-stdin` and
+# discarded inside one shell. It is never an Ansible variable, never a process
+# argument, and never written to this repo. Only the username and the outcome
+# are printed - which is why this task does NOT need no_log, and is better for
+# it: the deploy log says which path authentication took.
+#
+# Nothing here is fatal. A revoked credential, a moved upstream file, no route
+# to raw.githubusercontent.com - all end in an anonymous pull, which is what
+# happened before this existed.
+- name: Authenticate to Docker Hub with the substrate's published credential
+  ansible.builtin.shell: |
+    set -uo pipefail
+    raw=$(curl -fsS --max-time 20 {{ substrate_docker_login_url | quote }}) \
+      || { echo "FETCH_FAILED - could not read the upstream role over HTTPS"; exit 0; }
+    u=$(printf '%s' "$raw" | grep -A3 'docker_login' | grep -i 'username:' \
+        | head -1 | sed 's/.*username:[[:space:]]*//' | tr -d '"\047 \r')
+    p=$(printf '%s' "$raw" | grep -A3 'docker_login' | grep -i 'password:' \
+        | head -1 | sed 's/.*password:[[:space:]]*//' | tr -d '"\047 \r')
+    if [ -z "$u" ] || [ -z "$p" ]; then
+      echo "NOT_FOUND - upstream no longer carries a docker_login credential"
+      exit 0
+    fi
+    if printf '%s' "$p" | docker login --username "$u" --password-stdin >/dev/null 2>&1; then
+      echo "LOGGED_IN as $u"
+    else
+      echo "REJECTED - Docker Hub refused the credential for $u (rotated or revoked)"
+    fi
+  args:
+    executable: /bin/bash
+  register: substrate_login
+  changed_when: "'LOGGED_IN' in substrate_login.stdout"
+  failed_when: false
+  when:
+    - substrate_docker_login_enabled | bool
+    - (vault_dockerhub_pat | default('')) | length == 0
+
+- name: Report how Docker Hub authentication ended up
+  ansible.builtin.debug:
+    msg: >-
+      Docker Hub auth:
+      {% if (vault_dockerhub_pat | default('')) | length > 0 %}
+      using the PAT supplied on the command line.
+      {% elif 'LOGGED_IN' in (substrate_login.stdout | default('')) %}
+      {{ substrate_login.stdout | trim }} - pulls are counted against that
+      account rather than this sandbox's egress IP.
+      {% else %}
+      ANONYMOUS. {{ substrate_login.stdout | default('substrate login disabled') | trim }}.
+      Pulls now count against the per-IP quota shared by every sandbox on the
+      platform. The pre-pull below still takes four of the six images off Docker
+      Hub, so two anonymous pulls remain - usually enough. If this run does die
+      on a 429, supply your own token:
+      -e vault_dockerhub_pat=... -e vault_dockerhub_user=...
+      {% endif %}
+
+# Which pool the pulls will actually be billed to. Both paths lead to an
+# authenticated pull: a PAT on the command line, or the substrate credential
+# this role logged in with above. Only the preflight cares, and it cares a great
+# deal - see the note on the gate.
+- name: Record whether Docker Hub pulls will be authenticated
+  ansible.builtin.set_fact:
+    docker_hub_authenticated: >-
+      {{ ((vault_dockerhub_pat | default('')) | length > 0)
+         or ('LOGGED_IN' in (substrate_login.stdout | default(''))) }}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PREFLIGHT: is there enough Docker Hub quota to be worth starting?
+#
+# The 2026-09-10 09:37 build spent twenty minutes cloning MISP, building it,
+# starting NG-SOAR and patching DFIR-IRIS before discovering, on the sixth
+# image, that the quota was gone. The information needed to stop was available
+# before the first pull. Ask for it there.
+#
+# Docker publishes the headroom on a dedicated probe repository, and a HEAD on
+# a manifest is documented as not consuming a pull - so measuring costs nothing.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Preflight the Docker Hub rate limit before pulling anything
+  when: docker_hub_preflight_enabled | bool
+  block:
+    # The probe authenticates only with a command-line PAT, so when the
+    # credential in force is the substrate's the numbers below describe the
+    # ANONYMOUS pool - not the one the pulls will use. The gate accounts for
+    # that; nothing else here needs to.
+    - name: Get a registry token for the rate-limit probe
+      ansible.builtin.uri:
+        url: >-
+          https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull
+        method: GET
+        return_content: true
+        url_username: "{{ vault_dockerhub_user | default(omit, true) }}"
+        url_password: "{{ vault_dockerhub_pat | default(omit, true) }}"
+        force_basic_auth: "{{ (vault_dockerhub_pat | default('')) | length > 0 }}"
+        timeout: 20
+      register: hub_token
+      failed_when: false
+      no_log: true
+
+    # HEAD, not GET: a GET here would spend one of the very pulls being counted.
+    - name: Read the rate-limit headers
+      ansible.builtin.uri:
+        url: https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
+        method: HEAD
+        headers:
+          Authorization: "Bearer {{ hub_token.json.token | default('') }}"
+          Accept: application/vnd.docker.distribution.manifest.v2+json
+        status_code: [200, 401, 429]
+        timeout: 20
+      register: hub_limit
+      failed_when: false
+
+    # Headers look like "100;w=21600" - the count is everything before the ';'.
+    # They are ABSENT for accounts with no limit at all, which is a pass, not a
+    # failure: `remaining` stays -1 and means "unmeasurable", never "empty".
+    - name: Work out how much headroom there is
+      ansible.builtin.set_fact:
+        hub_remaining: >-
+          {{ ((hub_limit.ratelimit_remaining | default('')) | string).split(';')[0]
+             | default('', true) | int(-1) }}
+        hub_limit_total: >-
+          {{ ((hub_limit.ratelimit_limit | default('')) | string).split(';')[0]
+             | default('', true) | int(-1) }}
+
+    - name: Report the Docker Hub headroom
+      ansible.builtin.debug:
+        msg: >-
+          Docker Hub rate limit:
+          {% if hub_limit.status | default(0) == 429 %}
+          ALREADY EXHAUSTED - the registry answered 429 to the probe itself.
+          {% elif (hub_remaining | int) < 0 %}
+          not reported by the registry (an unlimited account, or the probe could
+          not be reached). Proceeding; a 429 later will still be named by the
+          compose tasks.
+          {% else %}
+          {{ hub_remaining }} of {{ hub_limit_total }} pulls remaining; this
+          deploy needs about {{ docker_hub_required_pulls }}.
+          {% endif %}
+          {% if docker_hub_authenticated | bool %}
+          These are ANONYMOUS figures and this deploy is authenticated, so they
+          describe a pool it will not use - measured because the probe cannot
+          authenticate without a command-line PAT. Informational only; the gate
+          below does not act on them.
+          {% else %}
+          Anonymous - the quota is shared by every sandbox on this egress IP,
+          and it is the pool this deploy will pull from.
+          {% endif %}
+
+    # Blocking, but only on a MEASURED shortfall IN THE POOL THIS DEPLOY WILL
+    # USE. Three ways out, and each one is a lesson already paid for:
+    #
+    #  * An unreachable probe or an unpublished limit (remaining -1). "Could not
+    #    measure" must never read as "empty" - the same reason the NG-SIEM gate
+    #    does not fail when agent_control is missing from the image.
+    #
+    #  * AUTHENTICATED pulls. The probe can only authenticate with a
+    #    command-line PAT, so when the credential in force is the substrate's it
+    #    measures the anonymous per-IP pool instead - a pool the deploy will not
+    #    touch. On 2026-09-10 12:53 that cost a working deployment: `docker
+    #    login` had succeeded as demongsoc, four of the six images had left
+    #    Docker Hub entirely, two authenticated pulls remained against a
+    #    200/hour account - and this gate stopped the run at task 23 because the
+    #    egress IP's anonymous quota, which nothing was going to spend, read 0.
+    #    A gate measuring the wrong pool is worse than no gate: it fails the
+    #    healthy case, which is exactly what it exists to avoid.
+    #
+    # The 429 fail-fast on the compose tasks remains the safety net for the
+    # authenticated path, and it names the PAT when it fires.
+    - name: GATE - do not start a build the quota cannot finish
+      ansible.builtin.assert:
+        that:
+          - (docker_hub_authenticated | bool) or hub_limit.status | default(0) != 429
+          - >-
+            (docker_hub_authenticated | bool)
+            or (hub_remaining | int) < 0
+            or (hub_remaining | int) >= (docker_hub_required_pulls | int)
+        fail_msg: >-
+          Stopping before the first pull: this deploy pulls ANONYMOUSLY and
+          Docker Hub has
+          {{ 'already returned 429 to the probe'
+             if hub_limit.status | default(0) == 429
+             else hub_remaining ~ ' pulls left, against about '
+                  ~ docker_hub_required_pulls ~ ' needed' }}.
+          Starting now would clone MISP, build it, start NG-SOAR and then die on
+          an image twenty minutes in - which is exactly what the 2026-09-10
+          09:37 build did. {{ docker_hub_rate_limit_help }}
+        success_msg: >-
+          {% if docker_hub_authenticated | bool %}
+          Docker Hub gate does not apply - pulls are authenticated, so the
+          anonymous figures above are not this deploy's pool. A 429 on an
+          authenticated pull is still caught, by name, at the compose task.
+          {% else %}
+          Docker Hub headroom is sufficient for an anonymous deploy
+          ({{ 'unmeasured' if (hub_remaining | int) < 0 else hub_remaining ~ ' pulls' }}).
+          {% endif %}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Spend less of that quota: pull four of the six images from registries that do
+# not share Docker Hub's per-IP limit, and re-tag them under their Docker Hub
+# names so compose finds them in the local cache and never asks Docker Hub.
+# See defaults/main.yml for the digest comparison proving these are the same
+# images, and for why this re-tags instead of editing three upstream compose
+# files.
+#
+# NEVER FATAL. A tag that has moved is simply left to Docker Hub, which is the
+# behaviour that existed before this task. The report says which.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Pre-pull images from registries that are not rate-limited
+  ansible.builtin.shell: |
+    set -u
+    seed() {
+      hub="$1"; src="$2"
+      if docker image inspect "$hub" >/dev/null 2>&1; then
+        echo "CACHED  $hub (already local, no pull needed)"
+        return
+      fi
+      if docker pull "$src" >/dev/null 2>&1; then
+        docker tag "$src" "$hub"
+        echo "SEEDED  $hub <- $src"
+      else
+        echo "MISS    $hub (not at $src - will come from Docker Hub)"
+      fi
+    }
+    {% for i in docker_hub_prepull %}
+    seed {{ i.hub | quote }} {{ i.from | quote }}
+    {% endfor %}
+  args:
+    executable: /bin/bash
+  register: hub_seed
+  changed_when: "'SEEDED' in hub_seed.stdout"
+  failed_when: false
+
+- name: Report which images avoided Docker Hub
+  ansible.builtin.debug:
+    msg: >-
+      {{ hub_seed.stdout_lines | default(['(pre-pull did not run)']) }}
+      Every CACHED or SEEDED line is one Docker Hub pull this deploy does not
+      make. Only cossas/soarca and cyentific/cacao-roaster have to come from
+      Docker Hub - they are published nowhere else.
+
+- name: Download MISP docker
+  git:
+    repo: "https://github.com/MISP/misp-docker.git"
+    dest: "/opt/misp-docker"
+    # Pinned, not `master`. See misp_docker_version in defaults/main.yml for
+    # which revision, why, and how to move it.
+    version: "{{ misp_docker_version }}"
+  
+- name: Copy MISP env
+  copy:
+    src: /opt/misp-docker/template.env
+    dest: /opt/misp-docker/.env
+    remote_src: yes
+
+# ── The port variables misp-docker reads ─────────────────────────────────────
+# Upstream split nginx out of misp-core, and that container owns the host ports:
+#     - "${NGINX_HTTP_PORT:-80}:8080"
+#     - "${NGINX_HTTPS_PORT:-443}:8443"
+# The names used to be CORE_HTTP_PORT / CORE_HTTPS_PORT. Nothing read those any
+# more, so MISP published on 80/443 while the whole project addressed :8443, and
+# the 2026-09-10 12:22 build died on `MISP /servers/getVersion -> HTTP -1`.
+#
+# This role wrote BOTH names for a while, to survive whichever revision the clone
+# landed on. It no longer does: the clone and its images are now pinned together
+# to one upstream commit (misp_docker_version / misp_docker_images in defaults),
+# so there is one naming to satisfy. Upstream's misp-core entrypoint has also
+# since declared CORE_HTTP_PORT / CORE_HTTPS_PORT deprecated and exits 1 if either
+# reaches the container. They never did - the compose passes no env_file and never
+# lists them - but writing names upstream has made fatal is a trap waiting for the
+# next compose change.
+- name: Publish MISP on the ports this project addresses (current upstream names)
+  ansible.builtin.lineinfile:
+    path: /opt/misp-docker/.env
+    regexp: "^#?\\s*{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    state: present
+  loop:
+    - { key: 'NGINX_HTTP_PORT', value: "{{ misp_http_host_port }}" }
+    - { key: 'NGINX_HTTPS_PORT', value: "{{ misp_https_host_port }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Change BASE_URL in env for MISP
+  lineinfile:
+    path: /opt/misp-docker/.env
+    regexp: '^#?\s*BASE_URL='
+    line: 'BASE_URL=https://{{ docker_server_internal_ip }}:{{ misp_https_host_port }}'
+    state: present
+    insertafter: EOF
+    backup: yes
+
+# ── Silence the 130-odd "variable is not set" warnings from MISP compose ─────
+# misp-docker's compose file references a large optional surface (LDAP, OIDC,
+# Azure AD, S3, SES, proxy, PyPI pins) that template.env ships commented out. On
+# every deploy compose emits one warning per unset variable — about 130 of them,
+# which is the overwhelming majority of the warnings in the build log and the
+# noise a real problem has to be spotted against.
+#
+# The names are DERIVED from the compose file rather than listed here: the pinned
+# misp-docker revision gets bumped over time, and a hardcoded list would silently
+# rot at the first bump that adds a variable.
+#
+# Only BARE `${VAR}` references are touched — the exact set compose warns about.
+# For those, compose already substitutes an empty string, so writing `VAR=`
+# makes explicit what is happening anyway and cannot change behaviour. A
+# reference carrying a default (`${VAR:-x}`) is skipped: it never warns, and
+# leaving it alone keeps its default intact.
+#
+# `grep -qE "^[[:space:]]*VAR="` matches only UNCOMMENTED definitions, so a
+# variable template.env or the tasks above actually set is never overwritten.
+- name: Pin every unset MISP compose variable to an explicit empty value
+  ansible.builtin.shell: |
+    set -u
+    cd /opt/misp-docker || { echo "ADDED=0 (no /opt/misp-docker)"; exit 0; }
+    compose=""
+    for f in docker-compose.yml compose.yml docker-compose.yaml; do
+      [ -f "$f" ] && compose="$compose $f"
+    done
+    [ -n "$compose" ] || { echo "ADDED=0 (no compose file found)"; exit 0; }
+    added=0
+    for v in $(grep -ohE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' $compose \
+               | tr -d '${}' | sort -u); do
+      if ! grep -qE "^[[:space:]]*${v}=" .env; then
+        echo "${v}=" >> .env
+        added=$((added+1))
+      fi
+    done
+    echo "ADDED=$added"
+  args:
+    executable: /bin/bash
+  register: misp_env_pinned
+  changed_when: "'ADDED=0' not in misp_env_pinned.stdout"
+
+- name: Report how many MISP variables were pinned
+  ansible.builtin.debug:
+    msg: >-
+      MISP .env: {{ misp_env_pinned.stdout | trim }} previously-unset compose
+      variables pinned to empty. Behaviour is unchanged — compose was already
+      substituting a blank string for each of them; the deploy log just stops
+      saying so 130 times.
+
+# ── TLS for the misp-nginx container ─────────────────────────────────────────
+# The third failure from one upstream restructure, after the compose variables
+# and the ports. Splitting nginx out of misp-core moved the ./ssl mount with it,
+# and the new container CANNOT create what it needs:
+#
+#     volumes:  - "./ssl:/etc/nginx/certs:ro"      <- read-only
+#     read_only: true
+#
+# so certificates have to exist on the host first. Upstream's README is explicit
+# about the consequence: "SSL is automatically disabled if certificates are
+# missing". Not a warning, not a 502 - nginx simply stops listening on 8443
+# inside the container, while Docker still publishes the host port. The
+# 2026-09-10 13:22 build reached play 8 and died on `MISP /servers/getVersion ->
+# HTTP -1` because there was nothing behind a port that looked open.
+#
+# When misp-core served its own nginx it generated these itself. It does not any
+# more, and iris_nginx has needed the same treatment here all along.
+#
+# Filenames are upstream's (cert.pem / key.pem, optional ca.pem). SANs cover
+# both the address group_vars resolves and localhost, so the cert is valid for
+# the probe below as well as for a trainee's browser - not that anything
+# validates it: every consumer here sets validate_certs false, because a
+# self-signed cert on a throwaway range is the point.
+- name: Create the SSL directory misp-nginx mounts
+  ansible.builtin.file:
+    path: /opt/misp-docker/ssl
+    state: directory
+    mode: '0755'
+
+- name: Generate the self-signed TLS certificate misp-nginx requires
+  ansible.builtin.shell: |
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /opt/misp-docker/ssl/key.pem \
+      -out /opt/misp-docker/ssl/cert.pem \
+      -subj '/C=XX/ST=CyberRange/L=Lab/O=CTI-SS/CN={{ docker_server_internal_ip }}' \
+      -addext 'subjectAltName = IP:{{ docker_server_internal_ip }}, DNS:localhost, IP:127.0.0.1'
+    chmod 644 /opt/misp-docker/ssl/cert.pem
+    chmod 644 /opt/misp-docker/ssl/key.pem
+  args:
+    creates: /opt/misp-docker/ssl/cert.pem
+
+# ── Pin the images, and give misp-core a realistic start-up window ───────────
+# Both go in docker-compose.override.yml, which compose loads automatically beside
+# docker-compose.yml and which upstream's own .gitignore excludes: it is the
+# mechanism misp-docker intends for local adjustment, so nothing upstream is
+# edited and the pinned clone stays clean for git.
+#
+# IMAGES. Pinning the clone alone pinned half the build. The compose file pulls
+# ghcr.io/misp/misp-docker/*:${CORE_RUNNING_TAG:-latest}, and upstream CI rebuilt
+# `latest` - and the version tag v2.5.46 with it - on 2026-09-11 12:52 from
+# e8b11b9. The 2026-09-14 deploy therefore ran a 5fe2022 compose file against
+# images built two commits later. Every image is now referenced by DIGEST, from
+# the same commit as the clone. Tags on ghcr move; digests do not.
+#
+# START-UP WINDOW. That deploy failed on `container misp-docker-misp-core-1 is
+# unhealthy`. misp-core's healthcheck probes php-fpm on 9002 with a 60s grace
+# period, and in images built since bd648a5 the fpm entrypoint runs init_mysql,
+# init_misp.sh and configure_misp.sh BEFORE starting php-fpm - a first boot, on
+# an empty database, on a sandbox VM. That is the best-supported explanation and
+# NOT a proven one: the log held no container output, and two other candidates
+# were refuted against upstream's source first. A passing probe ends the start
+# period at once, so a healthy MISP is not delayed at all; only a slow first boot
+# stops being reported as a broken one. The rescue below now records misp-core's
+# own logs, so a failure that survives this names its cause.
+- name: Pin MISP images by digest and widen misp-core's start-up window
+  ansible.builtin.copy:
+    dest: /opt/misp-docker/docker-compose.override.yml
+    mode: '0644'
+    content: |
+      # Managed by the lm5-1c docker_server role - edit the role defaults, not this.
+      services:
+        misp-core:
+          image: "{{ misp_docker_images['misp-core'] }}"
+          healthcheck:
+            start_period: {{ misp_core_start_period }}
+        misp-nginx:
+          image: "{{ misp_docker_images['misp-nginx'] }}"
+        misp-modules:
+          image: "{{ misp_docker_images['misp-modules'] }}"
+        misp-guard:
+          image: "{{ misp_docker_images['misp-guard'] }}"
+
+# No retry here, and none wanted: this task already fails on the first attempt.
+# What it lacked was a reason. MISP pulls mariadb and valkey from Docker Hub, so
+# it is just as exposed to the 429 as DFIR-IRIS is - it simply happens to pull
+# earlier, while there is still quota left.
+- name: Deployment of MISP Docker
+  block:
+    - name: Deployment of MISP Docker
+      community.docker.docker_compose_v2:
+        project_src: "/opt/misp-docker"
+        state: present
+    #    build: always
+      register: misp_output
+
+  rescue:
+    # A compose failure says WHICH container, never WHY. The 2026-09-14 deploy
+    # stopped on "misp-core is unhealthy" with nothing more to go on, and two
+    # plausible causes had to be refuted against upstream's source before a third
+    # could even be offered - none provable, because misp-core's own output was
+    # never collected. Collect it before the failure message, whatever the cause.
+    # `cmd:` form, so split_args never parses the script at playbook load.
+    - name: Collect misp-core and misp-nginx logs and health state
+      ansible.builtin.shell:
+        cmd: |
+          set +e
+          echo "=== containers ==="
+          docker ps -a --filter name=misp-docker
+          for c in misp-docker-misp-core-1 misp-docker-misp-nginx-1; do
+            echo "=== state of $c ==="
+            docker inspect --format '{{ "{{" }}json .State{{ "}}" }}' "$c" 2>&1 | cut -c1-3000
+            echo "=== last log lines of $c ==="
+            docker logs --tail 80 "$c" 2>&1
+          done
+        executable: /bin/bash
+      register: misp_evidence
+      changed_when: false
+      failed_when: false
+
+    - name: Show why MISP did not come up
+      ansible.builtin.debug:
+        var: misp_evidence.stdout_lines
+
+    - name: Say whether MISP failed on the Docker Hub rate limit
+      ansible.builtin.fail:
+        msg: >-
+          {% if (misp_output.msg | default('') ~ ' ' ~ misp_output.stderr | default('')) | lower
+                is search(docker_hub_rate_limit_pattern) %}
+          MISP could not be deployed. {{ docker_hub_rate_limit_help }}
+          Docker said: {{ misp_output.msg | default('(no message)') }}
+          {% else %}
+          MISP could not be deployed, and it is NOT a Docker Hub rate limit.
+          misp-core's and misp-nginx's own logs and health state are in the
+          task output just above this one - read those first.
+          Docker said: {{ misp_output.msg | default('(no message)') }}
+          {{ misp_output.stderr | default('') }}
+          {% endif %}
+
+# ── Is MISP actually SERVING where the rest of the project thinks it is? ──
+# `docker compose up` succeeding means the containers started, NOT that anything
+# answers. Two builds died eight plays later on `MISP /servers/getVersion ->
+# HTTP -1` for two different reasons, and both were visible right here:
+#
+#   2026-09-10 12:22  upstream renamed the port variables, so MISP published on
+#                     :443 while the project addressed :8443.
+#   2026-09-10 13:22  the port was right, but misp-nginx had no certificate and
+#                     upstream disables SSL when certificates are missing, so
+#                     nothing inside the container listened on 8443 at all.
+#
+# The first version of this gate used wait_for on the port, and it PASSED during
+# the second failure - `elapsed: 0`, while MISP served nothing. docker-proxy
+# binds the host port as soon as the container starts, whatever is or is not
+# listening behind it, so an open socket here proves only that Docker did its
+# half. It cannot see this class of fault, which is most of the point of the
+# gate.
+#
+# So ask for an HTTP response instead. ANY status counts - 200, 302, 403, even
+# 502 - because the claim being tested is "TLS terminates and something answers",
+# not "MISP is ready". Readiness takes minutes and puc2_keys already waits five
+# for it. The retry budget is here only so a container that is still starting is
+# not called broken.
+- name: Wait for MISP to answer over HTTPS on the port this project addresses
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ misp_https_host_port }}/"
+    method: GET
+    validate_certs: false
+    status_code: [200, 301, 302, 401, 403, 404, 500, 502, 503]
+    timeout: 15
+  register: misp_https
+  retries: 20
+  delay: 15
+  until: misp_https.status | default(-1) > 0
+  ignore_errors: true
+
+- name: Read back what MISP published and whether it has a certificate
+  ansible.builtin.shell: |
+    set -o pipefail
+    echo "PUBLISHED PORTS:"
+    docker compose -f /opt/misp-docker/docker-compose.yml ps --format '{{ "{{" }}.Service{{ "}}" }} {{ "{{" }}.Ports{{ "}}" }}' 2>/dev/null       || docker ps --filter 'name=misp-docker' --format '{{ "{{" }}.Names{{ "}}" }} {{ "{{" }}.Ports{{ "}}" }}'
+    echo "SSL DIRECTORY:"
+    ls -l /opt/misp-docker/ssl/ 2>&1 || echo "  (missing)"
+    echo "NGINX LOG TAIL:"
+    docker logs --tail 15 misp-docker-misp-nginx-1 2>&1 || echo "  (no misp-nginx container)"
+  args:
+    chdir: /opt/misp-docker
+    executable: /bin/bash
+  register: misp_published
+  changed_when: false
+  failed_when: false
+  when: misp_https is failed or (misp_https.status | default(-1)) < 0
+
+- name: GATE - MISP answers on the port every address in this project uses
+  ansible.builtin.assert:
+    that:
+      - (misp_https.status | default(-1)) > 0
+    fail_msg: >-
+      Nothing answered HTTPS on {{ misp_https_host_port }}, so every address in
+      this project is wrong: group_vars/puc2_2c.yml, cti_lookup.sh,
+      share_intel.sh, the preflight dashboard probe, and levels L1/L9/L15/L24 of
+      the training definition all say
+      https://<docker-server>:{{ misp_https_host_port }}.
+      The probe returned status {{ misp_https.status | default('-1') }}
+      ({{ misp_https.msg | default('no message') }}).
+      TWO CAUSES HAVE DONE THIS, both from upstream restructuring misp-docker
+      while this role still cloned it at `master`:
+      (1) NO CERTIFICATE. misp-nginx mounts ./ssl read-only and runs read_only,
+      so it cannot make its own, and upstream disables SSL outright when
+      cert.pem / key.pem are missing - the port stays bound by docker-proxy and
+      nothing listens behind it. This role generates them before the compose;
+      check the SSL DIRECTORY listing below.
+      (2) WRONG PORT. The port variables were renamed
+      (CORE_HTTP_PORT/CORE_HTTPS_PORT -> NGINX_HTTP_PORT/NGINX_HTTPS_PORT);
+      this role writes the NGINX_* names the pinned revision reads, so check
+      PUBLISHED PORTS below against {{ misp_https_host_port }}.
+      {{ misp_published.stdout | default('(could not read)') | trim }}
+    success_msg: >-
+      MISP answers HTTPS on {{ misp_https_host_port }}
+      (status {{ misp_https.status | default('?') }}) - the address group_vars,
+      the console helpers and the training definition all use.
+
+- name: Deploy Portainer
+  community.docker.docker_container:
+    name: portainer
+    image: portainer/portainer-ce:latest
+    state: started
+    restart_policy: always
+    ports: 
+      - "9443:9443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "portainer_data:/data"
+  register: portainer_output
+  when: puc2_deploy_portainer | default(false) | bool
+
+- name: Build and run RITA backend services
+  community.docker.docker_compose_v2:
+    project_src: "/opt/rita-docker/backend-container"
+    state: present
+    build: always
+  register: backend_compose_output
+  when: puc2_deploy_rita | default(false) | bool
+
+- name: Build and run RITA frontend services
+  community.docker.docker_compose_v2:
+    project_src: "/opt/rita-docker/frontend-container"
+    state: present
+    build: always
+  register: frontend_compose_output
+    
+  when: puc2_deploy_rita | default(false) | bool
+- name: Build and run RITA tools services
+  community.docker.docker_compose_v2:
+    project_src: "/opt/rita-docker/tools-containers"
+    state: present
+    build: always
+  register: tools_compose_output
+  when: puc2_deploy_rita | default(false) | bool
+
+# Add it later
+#- name: Build and run DFIR-IRIS
+#  community.docker.docker_compose_v2:
+#    project_src: "/opt/dfir-iris-custom"
+#    state: present
+#    build: always
+#  register: dfir_iris_output
+
+# NG-SOAR pulls three Docker Hub images (soarca, cacao-roaster, mongo) - the
+# heaviest Docker Hub consumer in this role, and the one that leaves DFIR-IRIS
+# without quota when the limit is close.
+- name: Build and run NG-SOAR
+  block:
+    - name: Build and run NG-SOAR
+      community.docker.docker_compose_v2:
+        project_src: "/opt/NG-SOAR"
+        state: present
+        build: always
+      register: NG_SOAR_output
+
+  rescue:
+    - name: Say whether NG-SOAR failed on the Docker Hub rate limit
+      ansible.builtin.fail:
+        msg: >-
+          {% if (NG_SOAR_output.msg | default('') ~ ' ' ~ NG_SOAR_output.stderr | default('')) | lower
+                is search(docker_hub_rate_limit_pattern) %}
+          NG-SOAR could not be deployed. {{ docker_hub_rate_limit_help }}
+          Docker said: {{ NG_SOAR_output.msg | default('(no message)') }}
+          {% else %}
+          NG-SOAR could not be deployed, and it is NOT a Docker Hub rate limit.
+          Docker said: {{ NG_SOAR_output.msg | default('(no message)') }}
+          {{ NG_SOAR_output.stderr | default('') }}
+          {% endif %}
+
+- name: Get or generate MISP API key for admin user
+  community.docker.docker_container_exec:
+    container: misp-docker-misp-core-1
+    command: "/var/www/MISP/app/Console/cake user change_authkey admin@admin.test"
+  register: misp_user_info
+  until: misp_user_info.rc == 0
+  retries: 30
+  delay: 15
+  no_log: true          # stdout IS the new API key
+
+- name: Save MISP API key fact
+  set_fact:
+    misp_api_key: "{{ misp_user_info.stdout.split('Old authentication keys disabled and new key created: ')[1] | trim }}"
+    cacheable: yes
+  no_log: true
+
+- name: Confirm a MISP API key was obtained
+  ansible.builtin.assert:
+    that:
+      - misp_api_key | default('') | trim | length > 0
+    fail_msg: >-
+      The MISP admin authkey could not be read from
+      `cake user change_authkey`. Nothing downstream can talk to MISP.
+    success_msg: >-
+      MISP API key obtained ({{ misp_api_key | length }} chars, fingerprint
+      {{ (misp_api_key | hash('sha256'))[:12] }}).
+
+- name: Inject MISP integration settings into DFIR-IRIS .env
+  lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^IRIS_MISP_URL='
+    line: "IRIS_MISP_URL=https://{{ docker_server_internal_ip }}:8443"
+    state: present
+
+- name: Disable SSL verification for MISP connection
+  lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^IRIS_MISP_VERIFY_CERT='
+    line: "IRIS_MISP_VERIFY_CERT=false"
+
+- name: Inject MISP key into CICMS (DFIR-IRIS) .env
+  lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^IRIS_MISP_KEY='
+    line: "IRIS_MISP_KEY={{ misp_api_key }}"
+    state: present
+
+# ── Fix the upstream server name in .env BEFORE building ─────────────────────
+
+- name: Fix IRIS_UPSTREAM_SERVER to match actual container/service name
+  ansible.builtin.lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^IRIS_UPSTREAM_SERVER='
+    line: "IRIS_UPSTREAM_SERVER=iris_app"
+    state: present
+
+- name: Verify IRIS_UPSTREAM_PORT is set to 8000
+  ansible.builtin.lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^IRIS_UPSTREAM_PORT='
+    line: "IRIS_UPSTREAM_PORT=8000"
+    state: present
+
+- name: Disable secure-only session cookie so HTTP access works
+  ansible.builtin.lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^#?SESSION_COOKIE_SECURE='
+    line: "SESSION_COOKIE_SECURE=False"
+    state: present
+
+# Re-synced from ng-soc-ansible@integrations (bb871d3, 2026-10-13): the IRIS
+# bundle that replaced the old one around 2026-10-07 talks to NG-SOAR itself.
+- name: Inject NG-SOAR integration settings into DFIR-IRIS .env
+  ansible.builtin.lineinfile:
+    path: /opt/dfir-iris-custom/.env
+    regexp: '^{{ item.key }}='
+    line: "{{ item.key }}={{ item.value }}"
+    state: present
+  loop:
+    # cacao_roaster container from /opt/NG-SOAR (0.0.0.0:3000)
+    - { key: CACAO_ROASTER_URL, value: "http://{{ docker_server_internal_ip }}:3000" }
+    # soarca_server container from /opt/NG-SOAR (0.0.0.0:8080, plain HTTP)
+    - { key: SOARCA_URL,        value: "http://{{ docker_server_internal_ip }}:8080" }
+    # false = real runs through SOARCA, true = mocked demo output
+    - { key: NGSOAR_DEMO,       value: "false" }
+
+# ── Pre-generate TLS certs so nginx has them on first boot ───────────────────
+
+- name: Create nginx-certs directory on host
+  ansible.builtin.file:
+    path: /opt/dfir-iris-custom/nginx-certs
+    state: directory
+    mode: '0755'
+
+- name: Generate self-signed TLS cert for iris_nginx
+  ansible.builtin.shell: |
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /opt/dfir-iris-custom/nginx-certs/iris_dev_key.pem \
+      -out /opt/dfir-iris-custom/nginx-certs/iris_dev_cert.pem \
+      -subj '/C=XX/ST=CyberRange/L=Lab/O=IRIS/CN=iris.app.dev'
+    chmod 644 /opt/dfir-iris-custom/nginx-certs/iris_dev_key.pem
+    chmod 644 /opt/dfir-iris-custom/nginx-certs/iris_dev_cert.pem
+  args:
+    creates: /opt/dfir-iris-custom/nginx-certs/iris_dev_cert.pem
+
+# Free-form shell text: Ansible pairs the quotes in it when it loads the
+# playbook, comments included, so a lone apostrophe in a comment below aborts
+# the whole deploy before any task runs (2026-10-14: "bundle's").
+- name: Patch docker-compose.yml — mount certs into nginx and expose port 443
+  ansible.builtin.shell: |
+    python3 <<'PYEOF'
+    path = '/opt/dfir-iris-custom/docker-compose.yml'
+    with open(path) as f:
+        content = f.read()
+
+    changed = False
+    missing = []
+
+    # nginx listens on 443 ssl and the project addresses it as host 8083. The old
+    # bundle mapped "8083:80"; the bundle on the share since ~2026-10-07 maps
+    # "8080:80" (ng-soc-ansible@integrations handles both since bb871d3). Patching
+    # only the old form left nginx asking for host 8080, which SOARCA already
+    # holds, so it exited at once and 8083 never opened (2026-10-11 15:07).
+    for _src in ('"8083:80"', '"8080:80"'):
+        if _src in content:
+            content = content.replace(_src, '"8083:443"', 1)
+            changed = True
+            break
+    else:
+        if '"8083:443"' not in content:
+            missing.append('the nginx port mapping "8083:80" / "8080:80" / "8083:443"')
+
+    # The worker in the new bundle waits for "app:8000", but the service is iris_app,
+    # so the worker never starts: no module hooks, no webhooks. Optional - the old
+    # bundle does not carry this line at all.
+    if '"app:8000"' in content:
+        content = content.replace('"app:8000"', '"iris_app:8000"', 1)
+        changed = True
+
+    # Add cert volumes to nginx service (insert before depends_on block)
+    if 'nginx-certs' not in content:
+        old = '    depends_on:\n      - iris_app\n    networks:\n      - iris_backend\n      - iris_frontend'
+        new = (
+            '    volumes:\n'
+            '      - ./nginx-certs/iris_dev_cert.pem:/www/certs/iris_dev_cert.pem:ro\n'
+            '      - ./nginx-certs/iris_dev_key.pem:/www/certs/iris_dev_key.pem:ro\n'
+            '    depends_on:\n      - iris_app\n    networks:\n      - iris_backend\n      - iris_frontend'
+        )
+        if old in content:
+            content = content.replace(old, new, 1)
+            changed = True
+        else:
+            missing.append("the nginx service's depends_on/networks block (where the cert volumes go)")
+
+    if changed:
+        with open(path, 'w') as f:
+            f.write(content)
+
+    # "already_patched" used to be printed for BOTH a compose file this task had
+    # already patched AND one it could not patch at all - so a new IRIS bundle
+    # whose compose no longer matched would sail through, nginx would start
+    # without certificates or on the wrong port, and the failure would surface
+    # minutes later as a bare port timeout. Say which it is.
+    if missing:
+        print('not_applicable: could not find ' + '; '.join(missing))
+    else:
+        print('patched' if changed else 'already_patched')
+    PYEOF
+  register: compose_patch
+  # an exact match: 'patched' is also a substring of 'already_patched'
+  changed_when: "compose_patch.stdout | trim == 'patched'"
+  failed_when: "'not_applicable' in compose_patch.stdout or compose_patch.rc != 0"
+
+# ── Make the image build independent of github.com egress (Option 2) ─────────
+# evtx2splunk pulls splunk-hec from git+https://github.com/... during
+# `pip3 install -r requirements.txt`. The sandbox's git clone to github.com is
+# reset ("Recv failure: Connection reset by peer", exit 128), which fails the
+# iris_app/worker image build and aborts the whole deployment on this first
+# play. PUC2 2c does not use the IRIS EVTX import pipeline, so comment out that
+# dependency chain (evtx2splunk + iris_evtx) to remove the git clone entirely.
+# Idempotent; every other requirement is left untouched.
+
+- name: Drop the git-backed EVTX dependency from DFIR-IRIS requirements
+  ansible.builtin.shell: |
+    python3 <<'PYEOF'
+    import re
+    path = '/opt/dfir-iris-custom/source/requirements.txt'
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print('no_requirements')
+        raise SystemExit(0)
+    changed = False
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith('#') and re.search(r'evtx2splunk|iris_evtx', s):
+            out.append('# PUC2-2c disabled (github egress): ' + ln.rstrip('\n') + '\n')
+            changed = True
+        else:
+            out.append(ln)
+    if changed:
+        with open(path, 'w') as f:
+            f.writelines(out)
+        print('patched')
+    else:
+        print('already_patched')
+    PYEOF
+  register: iris_reqs_patch
+  changed_when: "'patched' in iris_reqs_patch.stdout"
+
+# Compose v2 warns once per run that the top-level `version:` key is obsolete
+# and ignored. It is: the Compose Specification dropped it. Removing the key is
+# exactly what the warning asks for and changes nothing about the deployment.
+# Anchored to the start of the line so a `version:` nested inside a service
+# definition is never touched.
+- name: Drop the obsolete top-level version key from the DFIR-IRIS compose file
+  ansible.builtin.lineinfile:
+    path: /opt/dfir-iris-custom/docker-compose.yml
+    regexp: '^version:'
+    state: absent
+
+# ── Build and run — retried against transient network resets ─────────────────
+# The retry stays: a reset mid-build is real and a second attempt fixes it.
+# What it must NOT do is keep retrying a rate limit. See
+# defaults/main.yml (docker_hub_rate_limit_pattern) for why.
+# The 2026-10-11 15:07 build failed twice before it worked, and the log said
+# only "FAILED - RETRYING" each time: an until-loop keeps the result of the LAST
+# attempt and Ansible prints a retried attempt's result only at -vv. So the first
+# attempt runs on its own, its failure is reported in the log, and only then
+# does the retry loop start.
+- name: Build and run DFIR-IRIS
+  block:
+    - name: Build and run DFIR-IRIS - first attempt
+      community.docker.docker_compose_v2:
+        project_src: "/opt/dfir-iris-custom"
+        state: present
+        build: always
+      register: dfir_iris_first
+      ignore_errors: true   # reported by the next task, then retried or failed
+
+    - name: Report why the first DFIR-IRIS attempt failed
+      ansible.builtin.debug:
+        msg: >-
+          The first DFIR-IRIS build/run attempt failed{{ ' (Docker Hub rate limit - not retried)'
+          if ((dfir_iris_first.msg | default('') ~ ' ' ~ dfir_iris_first.stderr | default('')) | lower
+              is search(docker_hub_rate_limit_pattern)) else '; retrying' }}. Docker said:
+          {{ ((dfir_iris_first.msg | default('(no message)')) ~ ' '
+              ~ (dfir_iris_first.stderr | default(''))) | trim | truncate(2000) }}
+      when: dfir_iris_first is failed
+
+    - name: Build and run DFIR-IRIS
+      community.docker.docker_compose_v2:
+        project_src: "/opt/dfir-iris-custom"
+        state: present
+        build: always
+      register: dfir_iris_output
+      # Stop the loop on success OR on a rate limit. Breaking out on 429 does
+      # not make the task pass - it still fails, into the rescue below - it just
+      # fails with the right diagnosis instead of after every retry with the
+      # wrong one.
+      until: >-
+        dfir_iris_output is succeeded
+        or ((dfir_iris_output.msg | default('') ~ ' ' ~ dfir_iris_output.stderr | default('')) | lower
+            is search(docker_hub_rate_limit_pattern))
+      retries: 4
+      delay: 30
+      when:
+        - dfir_iris_first is failed
+        - not ((dfir_iris_first.msg | default('') ~ ' ' ~ dfir_iris_first.stderr | default('')) | lower
+               is search(docker_hub_rate_limit_pattern))
+
+    - name: Stop on a Docker Hub rate limit hit by the first attempt
+      ansible.builtin.fail:
+        msg: "rate limit on the first attempt"
+      when:
+        - dfir_iris_first is failed
+        - (dfir_iris_first.msg | default('') ~ ' ' ~ dfir_iris_first.stderr | default('')) | lower
+          is search(docker_hub_rate_limit_pattern)
+
+  rescue:
+    - name: Say whether this was the rate limit or a genuine build failure
+      ansible.builtin.fail:
+        # iris_build: the retry loop's result when it ran, otherwise the first
+        # attempt's. Set inside the template, so the result dict is never
+        # stringified on the way (a task-level var would be).
+        msg: >-
+          {% set iris_build = dfir_iris_output
+             if (dfir_iris_output is defined and dfir_iris_output is not skipped)
+             else dfir_iris_first %}
+          {% if (iris_build.msg | default('') ~ ' ' ~ iris_build.stderr | default('')) | lower
+                is search(docker_hub_rate_limit_pattern) %}
+          DFIR-IRIS could not be built. {{ docker_hub_rate_limit_help }}
+          Stopped after {{ 1 + (iris_build.attempts | default(0)) }} attempt(s) rather
+          than retrying into the same limit. Docker said:
+          {{ iris_build.msg | default('(no message)') }}
+          {% else %}
+          DFIR-IRIS could not be built, and it is NOT a Docker Hub rate limit -
+          the retry budget (1 + {{ iris_build.attempts | default('?') }} attempts)
+          was spent on a real failure. Docker said:
+          {{ iris_build.msg | default('(no message)') }}
+          {{ iris_build.stderr | default('') }}
+          {% endif %}
+
+# ── Wait for iris_app healthy ─────────────────────────────────────────────────
+
+# docker_container_info returns the whole container, environment included, and
+# Ansible logged that result: POSTGRES_PASSWORD, IRIS_SECRET_KEY and the MISP API
+# key, in clear, in the deployment log the platform keeps (2026-10-11 15:07).
+# Only the health status is needed, so only the health status is asked for.
+- name: Wait for iris_app container to become healthy
+  ansible.builtin.command:
+    cmd: "docker inspect --format '{% raw %}{{.State.Health.Status}}{% endraw %}' iris_app"
+  register: iris_app_health
+  until: iris_app_health.stdout | trim == 'healthy'
+  retries: 36
+  delay: 5
+  changed_when: false
+
+# ── Certs are volume-mounted from nginx-certs/ — nginx starts with them ──────
+# ── Restart to ensure clean state after compose up ───────────────────────────
+
+# ── DFIR-IRIS administrator password ─────────────────────────────────────────
+# The bundle on the share since ~2026-10-07 seeds its database from a dump that
+# already holds the administrator, so IRIS_ADM_PASSWORD is ignored and no
+# password is printed at first boot - which is exactly where CREDENTIALS.txt
+# used to send people. ng-soc-ansible@integrations (bb871d3) now sets it to a
+# fixed "IrisAdmin123", a password published in a public repository. Here it is
+# random per deploy, kept in a root-only file on this host, set with the
+# application's own bcrypt, and published inside the sandbox by puc2_credentials.
+# It never becomes an Ansible variable or a log line: the file is read by the
+# shell, and only the bcrypt hash crosses into the database.
+- name: Create a per-deploy DFIR-IRIS administrator password (root-only file)
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      f="{{ iris_admin_password_file }}"
+      if [ -s "$f" ]; then echo kept; exit 0; fi
+      umask 077
+      openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-20 > "$f"
+      [ "$(wc -c < "$f")" -ge 16 ] || { echo "password too short"; exit 1; }
+      echo created
+  register: iris_admin_pw_file
+  changed_when: "'created' in iris_admin_pw_file.stdout"
+
+- name: Set the DFIR-IRIS administrator password with the application's own bcrypt
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      hash=$(docker exec -i iris_app python3 -c 'import sys, bcrypt; print(bcrypt.hashpw(sys.stdin.read().strip().encode(), bcrypt.gensalt(12)).decode())' < "{{ iris_admin_password_file }}")
+      case "$hash" in
+        '$2'[aby]'$'*) ;;
+        *) echo "the iris_app bcrypt did not return a hash"; exit 1 ;;
+      esac
+      printf "UPDATE \"user\" SET password = '%s' WHERE \"user\" = 'administrator';\n" "$hash" \
+        | docker exec -i iris_db psql -U postgres -d iris_db -v ON_ERROR_STOP=1
+    executable: /bin/bash
+  register: iris_admin_pw_set
+  changed_when: "'UPDATE 1' in iris_admin_pw_set.stdout"
+  failed_when: "iris_admin_pw_set.rc != 0 or 'UPDATE 1' not in iris_admin_pw_set.stdout"
+
+# On 2026-10-11 15:07 iris_nginx exited with code 1 right after compose up and
+# again after this restart, port 8083 never opened, and the deploy died on a bare
+# "Timeout when waiting for 127.0.0.1:8083" - with no word from nginx itself,
+# which is the only thing that can say why. The rescue below collects that.
+- name: Start iris_nginx and wait for port 8083
+  block:
+    - name: Restart iris_nginx
+      ansible.builtin.command:
+        cmd: docker restart iris_nginx
+      changed_when: true
+
+    - name: Wait for iris_nginx to stabilise
+      ansible.builtin.pause:
+        seconds: 8
+
+    - name: Wait for DFIR-IRIS nginx port 8083
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8083
+        state: started
+        delay: 2
+        timeout: 60
+
+  rescue:
+    # Read-only. No environment is printed (the container's env holds secrets):
+    # state, published ports, mounts, the certificates on disk and nginx's log.
+    - name: Collect iris_nginx's own account of why 8083 is not open
+      ansible.builtin.shell:
+        cmd: |
+          {% raw %}
+          set +e
+          echo "== state =="
+          docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} restarts={{.RestartCount}}' iris_nginx
+          echo "== published ports =="
+          docker inspect --format '{{json .HostConfig.PortBindings}}' iris_nginx
+          echo "== mounts =="
+          docker inspect --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}' iris_nginx
+          echo "== certificates on the host =="
+          ls -l /opt/dfir-iris-custom/nginx-certs/
+          echo "== last 60 lines of the iris_nginx log =="
+          docker logs --tail 60 iris_nginx 2>&1
+          true
+          {% endraw %}
+      register: iris_nginx_diag
+      changed_when: false
+
+    - name: FAIL with nginx's own account of the failure
+      ansible.builtin.fail:
+        msg: |-
+          DFIR-IRIS nginx never listened on 127.0.0.1:8083, so CICMS is
+          unreachable and nothing after this point can run. What iris_nginx
+          reports about itself:
+          {{ iris_nginx_diag.stdout | default('(no diagnostics collected)') }}
+
+# ── Resolve DFIR-IRIS API key ─────────────────────────────────────────────────
+
+- name: Test known DFIR-IRIS API key against live instance
+  ansible.builtin.uri:
+    url: "https://localhost:8083/api/v1/users/me"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iris_bootstrap_api_key }}"
+      Content-Type: "application/json"
+    validate_certs: false
+    status_code: [200, 401, 403]
+    timeout: 15
+  register: iris_key_test
+  ignore_errors: true
+  no_log: true          # the Authorization header is a credential
+  # Skipped when no bootstrap key is configured, which is the default: an empty
+  # bearer token can only ever be rejected, and the DB fallback below is the
+  # path that actually produces the key.
+  when: iris_bootstrap_api_key | default('') | trim | length > 0
+
+# ── Extract key from DB if hardcoded key was rejected ────────────────────────
+
+- name: Extract DFIR-IRIS API key from DB (column api_key)
+  community.docker.docker_container_exec:
+    container: iris_db
+    command: >
+      psql -U postgres -d iris_db -t -A -c
+      "SELECT api_key FROM \"user\" WHERE name = 'administrator' LIMIT 1;"
+  register: iris_db_key_api_key
+  when: iris_key_test.status | default(0) != 200
+  ignore_errors: true
+  no_log: true          # stdout IS the API key
+
+- name: Extract DFIR-IRIS API key from DB (column auth_key fallback)
+  community.docker.docker_container_exec:
+    container: iris_db
+    command: >
+      psql -U postgres -d iris_db -t -A -c
+      "SELECT auth_key FROM \"user\" WHERE name = 'administrator' LIMIT 1;"
+  register: iris_db_key_auth_key
+  when:
+    - iris_key_test.status | default(0) != 200
+    - iris_db_key_api_key.stdout is not defined or iris_db_key_api_key.stdout | trim == ''
+  ignore_errors: true
+  no_log: true          # stdout IS the API key
+
+# ── Resolve and save key ──────────────────────────────────────────────────────
+
+- name: Set iris_api_key — from the bootstrap key (only if it still authenticates)
+  ansible.builtin.set_fact:
+    iris_api_key: "{{ iris_bootstrap_api_key }}"
+    cacheable: yes
+  when: iris_key_test.status | default(0) == 200
+  no_log: true
+
+- name: Set iris_api_key — from DB column api_key
+  ansible.builtin.set_fact:
+    iris_api_key: "{{ iris_db_key_api_key.stdout | trim }}"
+    cacheable: yes
+  when:
+    - iris_key_test.status | default(0) != 200
+    - iris_db_key_api_key is defined
+    - iris_db_key_api_key.stdout is defined
+    - iris_db_key_api_key.stdout | trim != ''
+
+- name: Set iris_api_key — from DB column auth_key (fallback)
+  ansible.builtin.set_fact:
+    iris_api_key: "{{ iris_db_key_auth_key.stdout | trim }}"
+    cacheable: yes
+  when:
+    - iris_key_test.status | default(0) != 200
+    - iris_api_key is not defined
+    - iris_db_key_auth_key is defined
+    - iris_db_key_auth_key.stdout is defined
+    - iris_db_key_auth_key.stdout | trim != ''
+
+- name: FAIL — could not obtain a valid DFIR-IRIS API key
+  ansible.builtin.fail:
+    # Reports the LENGTH of each candidate, never the value: this message used
+    # to print the freshly minted key in cleartext into the build log, which is
+    # how a live credential ends up in an artefact nobody treats as a secret.
+    msg: >
+      Could not obtain a working DFIR-IRIS API key.
+      Bootstrap key test: {{ iris_key_test.status | default('not configured') }}.
+      DB api_key column:  {{ iris_db_key_api_key.stdout | default('') | trim | length }} chars.
+      DB auth_key column: {{ iris_db_key_auth_key.stdout | default('') | trim | length }} chars.
+      Both zero means the query returned nothing: check the `iris_db` container
+      is up and which column holds the key in its `user` table.
+  when: iris_api_key is not defined or iris_api_key | trim == ''
+
+# ── Configure DFIR-IRIS modules via database ─────────────────────────────────
+
+- name: Write IRIS module configuration script
+  ansible.builtin.copy:
+    dest: /tmp/iris_configure_modules.py
+    mode: '0755'
+    content: |
+      #!/usr/bin/env python3
+      # module_config is a JSON array of {param_name, value, ...} objects.
+      # Fetch the array, patch the target element, write it back.
+      import subprocess, json
+
+      def psql_fetch(q):
+          r = subprocess.run(
+              ['docker','exec','iris_db','psql','-U','postgres','-d','iris_db','-t','-A','-c', q],
+              capture_output=True, text=True)
+          return r.stdout.strip()
+
+      def psql_exec(q):
+          r = subprocess.run(
+              ['docker','exec','iris_db','psql','-U','postgres','-d','iris_db','-c', q],
+              capture_output=True, text=True)
+          return r.returncode, r.stdout.strip() or r.stderr.strip()
+
+      updates = [
+          (
+              "iris_misp_module", "misp_config",
+              json.dumps({
+                  "name": "Public_MISP",
+                  "type": "public",
+                  "url":  ["https://{{ docker_server_internal_ip }}:8443"],
+                  "key":  ["{{ misp_api_key }}"],
+                  "ssl":  [False]
+              }, indent=2)
+          ),
+          (
+              "iris_webhooks_module", "wh_configuration",
+              json.dumps({
+                  "webhooks": [{
+                      "name":       "SOARCA",
+                      "url":        "http://{{ docker_server_internal_ip }}:8080/trigger/playbook",
+                      "method":     "POST",
+                      "trigger_on": ["alert_created", "case_created"]
+                  }]
+              }, indent=2)
+          ),
+      ]
+
+      for module_name, param_name, new_value in updates:
+          raw = psql_fetch(f"SELECT module_config FROM iris_module WHERE module_name = '{module_name}';")
+          if not raw:
+              print(f"SKIP: {module_name} not found"); continue
+          config = json.loads(raw)
+          for param in config:
+              if param.get('param_name') == param_name:
+                  param['value'] = new_value
+                  break
+          else:
+              print(f"SKIP: param '{param_name}' not found in {module_name}"); continue
+          safe = json.dumps(config).replace("'", "''")
+          rc, out = psql_exec(
+              f"UPDATE iris_module SET module_config = '{safe}'::json "
+              f"WHERE module_name = '{module_name}';"
+          )
+          print(f"{'OK' if rc == 0 else 'FAIL'}: {module_name}/{param_name} → {out}")
+
+- name: Apply IRIS module configurations
+  ansible.builtin.command: python3 /tmp/iris_configure_modules.py
+  register: iris_module_config
+  changed_when: true
+
+- name: Show module config results
+  ansible.builtin.debug:
+    msg: "{{ iris_module_config.stdout_lines }}"
+
+- name: Restart iris_app to reload module configurations
+  ansible.builtin.command: docker restart iris_app
+  changed_when: true
+
+# Health status only - see "Wait for iris_app container to become healthy".
+- name: Wait for iris_app to be healthy after module config restart
+  ansible.builtin.command:
+    cmd: "docker inspect --format '{% raw %}{{.State.Health.Status}}{% endraw %}' iris_app"
+  register: iris_app_health2
+  until: iris_app_health2.stdout | trim == 'healthy'
+  retries: 36
+  delay: 5
+  changed_when: false
+
+# ── DFIR-IRIS MISP module ────────────────────────────────────────────────────
+# The new bundle ships its modules disabled in the database. Enabling the MISP
+# module through the API is also what registers its hooks ("Get MISP insight"),
+# which the IRIS-MISP enrichment of UML step 8 relies on. Re-synced from
+# ng-soc-ansible@integrations bb871d3. Non-fatal and self-reporting: no graded
+# level depends on it (L9 and L15 read MISP through cti_lookup.sh).
+- name: Get DFIR-IRIS MISP module id
+  community.docker.docker_container_exec:
+    container: iris_db
+    command: >-
+      psql -U postgres -d iris_db -t -A -c
+      "SELECT id FROM iris_module WHERE module_name = 'iris_misp_module';"
+  register: iris_misp_mod_id
+  changed_when: false
+  failed_when: false
+
+- name: Enable the DFIR-IRIS MISP module (registers its hooks)
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:8083/manage/modules/enable/{{ iris_misp_mod_id.stdout | default('') | trim }}"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ iris_api_key }}"
+    validate_certs: false
+    return_content: true
+    timeout: 30
+    status_code: [200, 400]
+  register: iris_misp_enable
+  # "Module enabled", or an "already enabled" answer on a re-run
+  until: "'enabled' in (iris_misp_enable.content | default('') | lower)"
+  retries: 10
+  delay: 6
+  failed_when: false
+  no_log: true            # the Authorization header is a credential
+  when: iris_misp_mod_id.stdout | default('') | trim is match('^[0-9]+$')
+
+# The request is hidden for its token; the answer carries none, so it is shown.
+- name: Report whether the DFIR-IRIS MISP module is enabled
+  ansible.builtin.debug:
+    msg: >-
+      {% if iris_misp_enable is skipped %}
+      DFIR-IRIS MISP module NOT enabled: its id could not be read from iris_db
+      ({{ iris_misp_mod_id.stdout | default('') | trim | default('no output', true) }}).
+      {% elif 'enabled' in (iris_misp_enable.content | default('') | lower) %}
+      DFIR-IRIS MISP module enabled (HTTP {{ iris_misp_enable.status | default('?') }}).
+      {% else %}
+      DFIR-IRIS MISP module NOT enabled - HTTP {{ iris_misp_enable.status | default('?') }}:
+      {{ (iris_misp_enable.content | default('(no body)'))[:300] }}
+      {% endif %}
+      No graded level depends on it; L9 and L15 read MISP through cti_lookup.sh.
+
+######################## MISP MCP Server ######################################
+
+- name: Install python3-pip for MCP servers
+  ansible.builtin.apt:
+    name: python3-pip
+    state: present
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Install misp-mcp Python package from GitHub
+  ansible.builtin.pip:
+    name: "git+https://github.com/misp/misp-mcp.git"
+    executable: pip3
+    extra_args: --break-system-packages --ignore-installed
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Write MISP MCP credentials file
+  ansible.builtin.copy:
+    dest: /etc/misp-mcp.env
+    mode: '0600'
+    content: |
+      MISP_URL=https://{{ docker_server_internal_ip }}:8443
+      MISP_API_KEY={{ misp_api_key }}
+      MISP_VERIFYCERT=false
+
+- name: Deploy MISP MCP HTTP wrapper (streamable-HTTP, port 9001)
+  ansible.builtin.copy:
+    dest: /opt/misp-mcp-http.py
+    mode: '0644'
+    content: |
+      #!/usr/bin/env python3
+      """Run the misp-mcp FastMCP server over streamable-HTTP on port 9001 so
+      remote clients (mcpo / Open WebUI / AnythingLLM / LibreChat) can reach it.
+      Credentials come from /etc/misp-mcp.env (MISP_URL, MISP_API_KEY, MISP_VERIFYCERT)."""
+      from misp_mcp.server import mcp
+      from mcp.server.transport_security import TransportSecuritySettings
+
+      if __name__ == "__main__":
+          mcp.settings.host = "0.0.0.0"
+          mcp.settings.port = 9001
+          # Accept non-localhost Host headers (LAN IP / host.docker.internal / other
+          # containers). Without this the SDK's DNS-rebinding protection returns HTTP
+          # 421 to remote MCP clients. Safe on this trusted internal network.
+          mcp.settings.transport_security = TransportSecuritySettings(
+              enable_dns_rebinding_protection=False,
+          )
+          mcp.run(transport="streamable-http")
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Create misp-mcp systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/misp-mcp.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=MISP MCP Server (HTTP mode, port 9001)
+      After=network.target
+
+      [Service]
+      EnvironmentFile=/etc/misp-mcp.env
+      ExecStart=/usr/bin/python3 /opt/misp-mcp-http.py
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Reload systemd after creating misp-mcp service
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Enable and start misp-mcp service
+  ansible.builtin.service:
+    name: misp-mcp
+    enabled: yes
+    state: started
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+######################## DFIR-IRIS MCP Server (iris-mcp, HTTP mode) ###########
+
+- name: Ensure python3-venv is present (required for venv creation below)
+  ansible.builtin.apt:
+    name: python3-venv
+    state: present
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Clone iris-mcp repository
+  git:
+    repo: "https://github.com/srozb/iris-mcp.git"
+    dest: /opt/iris-mcp
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Create iris-mcp Python virtual environment
+  command:
+    cmd: python3 -m venv /opt/iris-mcp/venv
+    creates: /opt/iris-mcp/venv/bin/python3
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Install iris-mcp Python dependencies
+  ansible.builtin.pip:
+    name:
+      - "dfir-iris-client>=2.0.4"
+      - "fastmcp>=2.13.2"
+    virtualenv: /opt/iris-mcp/venv
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Write DFIR-IRIS MCP credentials file
+  ansible.builtin.copy:
+    dest: /etc/iris-mcp.env
+    mode: '0600'
+    content: |
+      IRIS_HOST=https://127.0.0.1:8083
+      IRIS_API_KEY={{ iris_api_key }}
+      IRIS_VERIFY_SSL=false
+
+- name: Deploy iris-mcp HTTP wrapper (binds 0.0.0.0:9000 for remote/container MCP clients)
+  ansible.builtin.copy:
+    dest: /opt/iris-mcp-http.py
+    mode: '0644'
+    content: |
+      #!/usr/bin/env python3
+      """Run iris-mcp's FastMCP server over HTTP on 0.0.0.0:9000 so remote clients
+      / containers (AnythingLLM, LibreChat) can reach it. The stock iris_mcp.py binds
+      127.0.0.1 in --http mode; this loads it as a module (skipping its stdio __main__
+      block) and serves the FastMCP instance on all interfaces."""
+      import importlib.util, sys
+      from fastmcp import FastMCP
+
+      sys.path.insert(0, "/opt/iris-mcp")   # so iris_mcp.py's local imports (types_catalog, ...) resolve
+      spec = importlib.util.spec_from_file_location("iris_mcp", "/opt/iris-mcp/iris_mcp.py")
+      mod = importlib.util.module_from_spec(spec)
+      sys.argv = ["iris_mcp"]                # stop --http/args being re-parsed
+      spec.loader.exec_module(mod)           # __name__ != "__main__" -> its run() is skipped
+
+      server = next(v for v in vars(mod).values() if isinstance(v, FastMCP))
+      server.run(transport="http", host="0.0.0.0", port=9000)
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Create iris-mcp systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/iris-mcp.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=DFIR-IRIS MCP Server (HTTP mode, port 9000)
+      After=network.target
+
+      [Service]
+      WorkingDirectory=/opt/iris-mcp
+      EnvironmentFile=/etc/iris-mcp.env
+      ExecStart=/opt/iris-mcp/venv/bin/python3 /opt/iris-mcp-http.py
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Reload systemd after creating iris-mcp service
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+- name: Enable and start iris-mcp service
+  ansible.builtin.service:
+    name: iris-mcp
+    enabled: yes
+    state: started
+  when: puc2_deploy_mcp_servers | default(false) | bool
+
+######################## AnythingLLM (chat UI + native MCP client) ###########
+# Talks to the MCP servers DIRECTLY over streamable-HTTP (misp :9001, iris :9000)
+# via host.docker.internal, so it does NOT use mcpo. Replaces Open WebUI on :4000.
+
+- name: Create AnythingLLM storage + plugins directory
+  ansible.builtin.file:
+    path: /opt/anythingllm/plugins
+    state: directory
+    mode: '0755'
+  when: puc2_deploy_anythingllm | default(false) | bool
+
+- name: Write AnythingLLM MCP servers config (MISP + DFIR-IRIS)
+  ansible.builtin.copy:
+    dest: /opt/anythingllm/plugins/anythingllm_mcp_servers.json
+    mode: '0644'
+    content: |
+      {
+        "mcpServers": {
+          "misp":      { "type": "streamable", "url": "http://host.docker.internal:9001/mcp" },
+          "dfir-iris": { "type": "streamable", "url": "http://host.docker.internal:9000/mcp" }
+        }
+      }
+  when: puc2_deploy_anythingllm | default(false) | bool
+
+- name: Ensure AnythingLLM storage is owned by the container user (uid 1000)
+  ansible.builtin.file:
+    path: /opt/anythingllm
+    state: directory
+    owner: "1000"
+    group: "1000"
+    recurse: yes
+  when: puc2_deploy_anythingllm | default(false) | bool
+
+- name: Run AnythingLLM container (host port 4000)
+  community.docker.docker_container:
+    name: anythingllm
+    image: mintplexlabs/anythingllm:latest
+    state: started
+    restart_policy: always
+    published_ports:
+      - "4000:3001"
+    capabilities:
+      - SYS_ADMIN
+    etc_hosts:
+      host.docker.internal: host-gateway
+    memory: "4g"
+    memory_swap: "8g"
+    env:
+      STORAGE_DIR: "/app/server/storage"
+    volumes:
+      - "/opt/anythingllm:/app/server/storage"
+  when: puc2_deploy_anythingllm | default(false) | bool
+
+######################## SACTI (Secure Aggregated CTI) ########################
+
+- name: Install SACTI build dependencies
+  ansible.builtin.apt:
+    name:
+      - cmake
+      - ninja-build
+      - libssl-dev
+      - python3-venv
+    state: present
+    update_cache: yes
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Clone liboqs (Open Quantum Safe C library)
+  git:
+    repo: "https://github.com/open-quantum-safe/liboqs.git"
+    dest: /opt/liboqs
+    version: main
+    force: yes
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Build and install liboqs shared library
+  ansible.builtin.shell: |
+    cmake -S /opt/liboqs -B /opt/liboqs/build \
+      -DBUILD_SHARED_LIBS=ON \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -GNinja
+    cmake --build /opt/liboqs/build -- -j$(nproc)
+    cmake --install /opt/liboqs/build
+    ldconfig
+    touch /opt/liboqs/.build_complete
+  args:
+    creates: /opt/liboqs/.build_complete
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Clone SACTI repository
+  git:
+    repo: "https://github.com/COSSAS/SACTI.git"
+    dest: /opt/sacti
+    force: yes
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Create SACTI Python virtual environment
+  command:
+    cmd: python3 -m venv /opt/sacti/venv
+    creates: /opt/sacti/venv/bin/python3
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Install SACTI Python dependencies
+  ansible.builtin.pip:
+    requirements: /opt/sacti/requirements.txt
+    virtualenv: /opt/sacti/venv
+    virtualenv_python: python3
+  environment:
+    LD_LIBRARY_PATH: /usr/local/lib
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Patch SACTI config.py — set MISP_KEY
+  ansible.builtin.lineinfile:
+    path: /opt/sacti/sacti/config.py
+    regexp: '^MISP_KEY\s*='
+    line: "MISP_KEY = '{{ misp_api_key }}'"
+    state: present
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Patch SACTI config.py — set MISP_URL
+  ansible.builtin.lineinfile:
+    path: /opt/sacti/sacti/config.py
+    regexp: '^MISP_URL\s*='
+    line: "MISP_URL = 'https://{{ docker_server_internal_ip }}:8443'"
+    state: present
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Patch SACTI config.py — update Sig_Alg for liboqs 0.10+ (Dilithium2 → ML-DSA-44)
+  ansible.builtin.lineinfile:
+    path: /opt/sacti/sacti/config.py
+    regexp: '^Sig_Alg\s*='
+    line: "Sig_Alg = 'ML-DSA-44'"
+    state: present
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Patch SACTI config.py — update Kem_Alg for liboqs 0.10+ (Kyber512 → ML-KEM-512)
+  ansible.builtin.lineinfile:
+    path: /opt/sacti/sacti/config.py
+    regexp: '^Kem_Alg\s*='
+    line: "Kem_Alg = 'ML-KEM-512'"
+    state: present
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Run SACTI PKI setup (post-quantum key generation, one-time)
+  ansible.builtin.shell: |
+    /opt/sacti/venv/bin/python3 sacti/pq_pki_utils.py && touch /opt/sacti/.pki_done
+  args:
+    chdir: /opt/sacti
+    creates: /opt/sacti/.pki_done
+  environment:
+    LD_LIBRARY_PATH: /usr/local/lib
+    PYTHONPATH: /opt/sacti
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Create SACTI aggregator systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/sacti-aggregator.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=SACTI Aggregator (secure CTI sharing)
+      After=network.target
+
+      [Service]
+      WorkingDirectory=/opt/sacti
+      Environment=LD_LIBRARY_PATH=/usr/local/lib
+      Environment=PYTHONPATH=/opt/sacti
+      ExecStart=/opt/sacti/venv/bin/python3 sacti/aggregator.py
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Create SACTI party systemd template service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/sacti-party@.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=SACTI Party %i
+      After=network.target sacti-aggregator.service
+
+      [Service]
+      WorkingDirectory=/opt/sacti
+      Environment=LD_LIBRARY_PATH=/usr/local/lib
+      Environment=PYTHONPATH=/opt/sacti
+      ExecStart=/opt/sacti/venv/bin/python3 sacti/party.py %i 801%i
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Reload systemd after creating SACTI services
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Enable and start SACTI aggregator
+  ansible.builtin.service:
+    name: sacti-aggregator
+    enabled: yes
+    state: started
+  when: puc2_deploy_sacti | default(false) | bool
+
+- name: Enable and start SACTI parties 1-3
+  ansible.builtin.service:
+    name: "sacti-party@{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - 1
+    - 2
+    - 3
+  when: puc2_deploy_sacti | default(false) | bool
+
+# ── Unmount ───────────────────────────────────────────────────────────────────
+
+- name: Unmount SMB share
+  ansible.builtin.mount:
+    path: "/mnt/smb_shared"
+    state: unmounted
+  when: true

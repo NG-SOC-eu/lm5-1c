@@ -1,0 +1,183 @@
+---
+# =============================================================================
+# PUC2 (CYNET) - Sub Case 2c: single source of truth for the scenario overlay.
+#
+# Loaded explicitly via `vars_files` by the overlay plays in playbook.yml (the
+# substrate topology declares `groups: []`, so plays target host names and a
+# group_vars/<group>.yml file would never be picked up automatically).
+#
+# ADDRESSING POLICY: every address is resolved from the inventory facts that
+# the substrate roles publish (docker_server / ng-siem set them with
+# `cacheable: yes`). The 10.0.16.x literals are only a fallback for when the
+# overlay is run standalone against an already-provisioned sandbox.
+#
+# NO SECRETS HERE. Credentials come from group_vars/vault.yml (git-ignored)
+# or, for MISP/IRIS, straight from the facts published by docker_server.
+# =============================================================================
+
+# ---- Host coordinates (UML actor -> substrate host) -------------------------
+# NG-SIEM                 -> ng-siem
+puc2_ng_siem_ip: "{{ hostvars['ng-siem']['ng_siem_internal_ip'] | default('10.0.16.70') }}"
+# CTI-SS (MISP) / CICMS (DFIR-IRIS) / NG-SOAR -> docker-server
+puc2_docker_server_ip: "{{ hostvars['docker-server']['docker_server_internal_ip'] | default('10.0.16.60') }}"
+# Phishing / payload delivery origin -> kali
+puc2_c2_ip: "{{ hostvars['kali']['ansible_all_ipv4_addresses'] | default([]) | select('match', '^10\\.0\\.16\\.') | first | default('10.0.16.50') }}"
+# Lab Hosts / Endpoints -> victim
+puc2_victim_ip: "{{ hostvars['victim']['ansible_all_ipv4_addresses'] | default([]) | select('match', '^10\\.0\\.16\\.') | first | default('10.0.16.100') }}"
+
+# Flat sandbox subnet. The isolation action (UML step 10) keeps this reachable
+# so the Wazuh agent and the SOC control channel survive quarantine.
+puc2_sandbox_cidr: "10.0.16.0/24"
+
+# ---- Service ports (as exposed by the substrate roles) ----------------------
+puc2_misp_port: 8443           # docker_server: CORE_HTTPS_PORT
+puc2_iris_port: 8083           # docker_server: iris_nginx 8083:443
+puc2_soar_webhook_port: 8080   # docker_server: IRIS webhook -> /trigger/playbook
+
+puc2_misp_url: "https://{{ puc2_docker_server_ip }}:{{ puc2_misp_port }}"
+puc2_iris_url: "https://{{ puc2_docker_server_ip }}:{{ puc2_iris_port }}"
+puc2_soar_webhook_url: "http://{{ puc2_docker_server_ip }}:{{ puc2_soar_webhook_port }}/trigger/playbook"
+
+# ---- Credentials sourced from the substrate facts ---------------------------
+# docker_server publishes both with `cacheable: yes`; vault.yml may override.
+puc2_misp_api_key: "{{ hostvars['docker-server']['misp_api_key'] | default(vault_misp_api_key | default('CHANGE_ME')) }}"
+puc2_iris_api_key: "{{ hostvars['docker-server']['iris_api_key'] | default(vault_iris_api_key | default('CHANGE_ME')) }}"
+
+# ---- Addresses the training definition hardcodes ----------------------------
+# The addresses above are RESOLVED from inventory facts. The training text is
+# not: level 10b grades the literal `10.0.16.50`, and the access primer and
+# several levels send trainees to fixed dashboard URLs. If resolution ever
+# disagrees with these, a trainee submits the right answer and is marked wrong,
+# or is sent to a dashboard that is not there — so the preflight gate compares
+# them and fails the deployment on a mismatch.
+puc2_expected_c2_ip: "10.0.16.50"              # L20, graded literally
+puc2_expected_victim_ip: "10.0.16.100"         # level text, trigger command
+puc2_expected_ng_siem_ip: "10.0.16.70"         # NG-SIEM dashboard URL
+puc2_expected_docker_server_ip: "10.0.16.60"   # MISP/IRIS/NG-SOAR URLs
+
+# ---- Values the training definition grades against --------------------------
+# Each of these is an exact string a trainee submits as an answer. Changing one
+# breaks the corresponding level; validation/validate_training.sh checks them.
+puc2_arm_token: "puc2-2c-armed"                # L4
+puc2_case_soc_id: "CASE-PUC2-2C"               # L14
+puc2_isolation_status: "isolated"              # L19
+puc2_eradication_status: "eradicated"          # L21
+puc2_mitre_initial_access: "T1566.001"         # L9  (Spearphishing Link)
+puc2_mitre_execution: "T1204.002"              # L26 (User Execution: Malicious File)
+puc2_victim_mail_spool: "/var/mail/victim"     # L5
+
+# ---- Scenario identity ------------------------------------------------------
+puc2_victim_user: "victim"
+puc2_payload_name: "invoice.exe"
+# Narrative only: no web server is deployed (not a UML component). The Cyber
+# Range performs the delivery directly on the endpoint.
+puc2_payload_url: "http://{{ puc2_c2_domain }}/{{ puc2_payload_name }}"
+puc2_quarantine_dir: "/var/quarantine"
+
+# ---- Wazuh agent on the endpoint --------------------------------------------
+# Empty: lab_endpoint_2c installs the agent at the version the NG-SIEM manager
+# runs. A manager refuses agents newer than itself, and the substrate installs
+# the newest one (4.14.7 against manager 4.4.0 on 2026-09-14: `Never connected`).
+# Set a full package version (e.g. "4.4.0-1") to pin explicitly instead; the
+# role still fails if that is newer than the manager.
+puc2_wazuh_agent_version: ""
+
+# ---- IOCs seeded into CTI-SS and matched by NG-SIEM -------------------------
+# The payload is an EICAR-equivalent benign artefact assembled at provision
+# time; its MD5 is the well-known EICAR md5, which is what rule 100101 matches
+# against the etc/lists/cti-malware-hashes CDB list.
+puc2_payload_md5: "44d88612fea8a8f36de82e1278abb02f"
+puc2_payload_sha256: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+puc2_c2_domain: "c2.puc2-training.lab"
+puc2_block_ips:
+  - "{{ puc2_c2_ip }}"
+
+# ---- Detection rule IDs (provisioning/roles/ng_siem_rules_2c/files) ---------
+puc2_rule_payload_dropped: 100100   # UML step 3
+puc2_rule_ioc_match: 100101         # UML steps 4-5  -> triggers active response
+puc2_rule_c2_blocked: 100102        # UML step 6
+puc2_rule_correlated: 100103        # UML step 6     -> triggers active response
+# Rules whose firing launches the puc2-isolate active response (UML steps 9-10).
+# ONLY 100103, the correlated "targeted attack confirmed" rule. Adding 100101
+# here fires containment on the FIRST payload drop, i.e. seconds into a delivery
+# that takes about a minute: the endpoint would then be isolated and the C2 name
+# sinkholed to 0.0.0.0 BEFORE stage 2 beacons, so rule 100102 could never fire
+# and UML step 6 would lose its firewall evidence. Containing only after
+# confirmation is also the order the UML draws (step 6 -> step 9).
+puc2_active_response_rules: "100103"
+
+# Administrative channel the isolation action keeps open (UML step 10). The
+# trainee and the step-13 evidence collector reach `victim` over SSH through the
+# CyberRangeCZ management interface, which is outside puc2_sandbox_cidr.
+puc2_admin_ssh_port: 22
+
+# ---- Containment markers read back for UML step 11 --------------------------
+puc2_isolation_marker: "/var/run/ngsoar_isolated"
+puc2_eradication_marker: "/var/run/ngsoar_eradication_status"
+
+# ---- Evaluation (UML step 13) ----------------------------------------------
+puc2_eval_root: "/opt/evaluation"
+
+# ---- On-host paths used by the overlay roles --------------------------------
+puc2_injection_root: "/opt/puc2"              # training L4 expects this exact path
+puc2_misp_seed_dir: "/opt/cti-ss-seed"
+puc2_iris_assets_dir: "/opt/cicms-assets"
+puc2_soar_playbook_dir: "/opt/NG-SOAR/playbooks"
+
+# ---- Endpoint access (used by the step-13 evidence collector) ---------------
+puc2_victim_mgmt_user: "ubuntu"     # topology base_box mgmt_user of `victim`
+
+# ---- Node login for the trainee (published; see puc2_node_access) ----------
+# The training runs `sudo` on the nodes and opens their consoles. The mgmt
+# user gets this known password and passwordless sudo so no level is blocked
+# on an undocumented credential. Not a secret: it is printed to trainees in L1
+# and CREDENTIALS.txt. Isolated, ephemeral training range.
+puc2_node_password: "PUC2-2c-training"
+
+# ---- CTI-SS sharing (UML step 12) -------------------------------------------
+puc2_misp_sharing_group_name: "NG-SOC-PUC2"   # training L24 expects this exact name
+
+# ---- Simulated C2 beacon (feeds the firewall source for rule 100102) --------
+# The payload "beacons" to this port; the endpoint has a pre-staged LOG+DROP
+# rule for it, so the attempt is blocked AND logged BEFORE containment runs.
+# That log line is the firewall telemetry UML step 6 correlates.
+puc2_c2_port: 4444
+puc2_fw_log_prefix: "PUC2-FW-DROP"
+
+# A syslog line shaped exactly like the one that LOG+DROP rule writes to
+# /var/log/kern.log on the endpoint. Fed through wazuh-logtest it must come back
+# matched by rule 100102: that is how the range proves analysisd LOADED the
+# ruleset rather than proving the files exist on disk. Keep it in sync with the
+# LOG rule in roles/lab_endpoint_2c and with rule 100102 in
+# roles/ng_siem_rules_2c/templates/local_rules.xml.j2.
+puc2_logtest_probe_line: >-
+  Jul 22 08:24:29 victim kernel: [12345.678901] {{ puc2_fw_log_prefix }}: IN= OUT=ens4
+  SRC={{ puc2_expected_victim_ip }} DST={{ puc2_expected_c2_ip }} LEN=60 TOS=0x00
+  PREC=0x00 TTL=64 ID=1 DF PROTO=TCP SPT=54321 DPT={{ puc2_c2_port }} WINDOW=64240
+  RES=0x00 SYN URGP=0
+
+# ---- Multi-stage delivery (makes rule 100103 reachable) --------------------
+# Rule 100103 needs repeated IOC matches inside its timeframe. A single drop
+# would only ever fire 100101 once, leaving UML step 6 without a live trigger.
+puc2_delivery_paths:
+  - "/home/victim/Downloads/invoice.exe"
+  - "/tmp/invoice.exe"
+  - "/home/victim/Downloads/statement.exe"
+
+# ---- Component trim: deploy only what the PUC2 2c UML actually uses ---------
+# The integrations substrate provisions a broader NG-SOC platform than this sub
+# case needs. The UML lifelines are Cyber Range, Lab Hosts/Endpoints, NG-SIEM,
+# CTI-SS, CICMS and NG-SOAR — so Wazuh, MISP, DFIR-IRIS and NG-SOAR stay and
+# everything below is switched off. These are flags rather than deletions so the
+# substrate roles remain re-syncable with ng-soc-ansible@integrations and any of
+# them can be brought back by flipping one value.
+#
+# NOTE: the two tasks that write /etc/misp-mcp.env and /etc/iris-mcp.env are
+# deliberately NOT gated. They survive their namesake because puc2_keys and
+# puc2_diag read the API keys from those files; only the MCP servers are gone.
+puc2_deploy_rita: false          # network traffic analysis — no UML lifeline
+puc2_deploy_mcp_servers: false   # MISP/IRIS MCP bridges for AI agents
+puc2_deploy_portainer: false     # Docker management UI
+puc2_deploy_anythingllm: false   # local LLM chat UI
+puc2_deploy_sacti: false         # post-quantum CTI aggregation (liboqs)
+puc2_deploy_pandora: false       # Pandora UI container on ng-siem

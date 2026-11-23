@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# =============================================================================
+# UML step 9 — "NG-SOAR Operator: execute containment playbooks".
+#
+# WHY THIS EXISTS: containment in this sandbox fires automatically through the
+# Wazuh active response, which is the reliable path — but it left the NG-SOAR
+# Operator, an actor the UML gives an explicit action, with no touchpoint at
+# all. This script is that touchpoint: it drives the SAME NG-SOAR webhook that
+# DFIR-IRIS already calls, so the operator exercises the real orchestration
+# path rather than a mock.
+#
+# IT DOES NOT REIMPLEMENT NG-SOAR. The workflow behind the webhook lives in the
+# NG-SOAR.yml compose stack the substrate deploys; this only POSTs to it.
+#
+# Usage:  ngsoar_trigger.sh [playbook] [target-ip]
+#   playbook  one of: isolate_host | block_malicious_ip |
+#                     quarantine_and_patch | reset_credentials  (default: all)
+#   target-ip endpoint to act on (default: {{ puc2_victim_ip }})
+# =============================================================================
+set -euo pipefail
+
+WEBHOOK="{{ puc2_soar_webhook_url }}"
+PLAYBOOK_DIR="{{ puc2_soar_playbook_dir }}"
+PLAYBOOK="${1:-all}"
+TARGET="${2:-{{ puc2_victim_ip }}}"
+
+VALID=(isolate_host block_malicious_ip quarantine_and_patch reset_credentials all)
+if [[ ! " ${VALID[*]} " =~ " ${PLAYBOOK} " ]]; then
+    echo "Unknown playbook '${PLAYBOOK}'. Valid: ${VALID[*]}" >&2
+    exit 2
+fi
+
+echo "[NG-SOAR] Requesting containment '${PLAYBOOK}' on ${TARGET} (UML step 9)"
+echo "[NG-SOAR] Webhook: ${WEBHOOK}"
+
+PAYLOAD=$(cat <<JSON
+{
+  "source": "puc2-2c-ngsoar-operator",
+  "playbook": "${PLAYBOOK}",
+  "playbook_dir": "${PLAYBOOK_DIR}",
+  "target": "${TARGET}",
+  "context": {
+    "case": "PUC2-2C",
+    "c2_ip": "{{ puc2_c2_ip }}",
+    "c2_domain": "{{ puc2_c2_domain }}",
+    "payload_md5": "{{ puc2_payload_md5 }}",
+    "sandbox_cidr": "{{ puc2_sandbox_cidr }}"
+  }
+}
+JSON
+)
+
+HTTP_CODE=$(curl -sk -o /tmp/ngsoar_trigger_response.json -w '%{http_code}' \
+  -X POST "${WEBHOOK}" \
+  -H "Content-Type: application/json" \
+  --data "${PAYLOAD}" --max-time 30 || echo "000")
+
+echo "[NG-SOAR] HTTP ${HTTP_CODE}"
+cat /tmp/ngsoar_trigger_response.json 2>/dev/null; echo
+
+case "${HTTP_CODE}" in
+  2*) echo "[NG-SOAR] Accepted. Verify the effect on ${TARGET} (UML steps 10-11):"
+      echo "          cat {{ puc2_isolation_marker }} {{ puc2_eradication_marker }}"
+      echo "[NG-SOAR] If the markers are not there yet, containment has not landed"
+      echo "          on the endpoint. Enforce it deterministically ON ${TARGET}:"
+      echo "          sudo /var/ossec/active-response/bin/puc2-isolate --now" ;;
+  000) echo "[NG-SOAR] Webhook unreachable. The active-response path remains the"
+       echo "          authoritative containment route. Enforce it ON ${TARGET}:"
+       echo "          sudo /var/ossec/active-response/bin/puc2-isolate --now" ; exit 1 ;;
+  # A rejection used to end here with "inspect the NG-SOAR workflow" and no way
+  # forward. On 2026-10-11 the webhook answered 400 "Failed to decode playbook":
+  # the endpoint is SOARCA's, it expects a CACAO playbook document, and this
+  # helper sends a trigger request naming one of the library's playbooks, which
+  # are Ansible-style. Posting a CACAO stub would turn the 400 into a 200 that
+  # contains nothing, and executing real actions from SOARCA would mean giving it
+  # SSH credentials for the endpoint. So a rejection is treated like an
+  # unreachable webhook: say what it means, and hand the operator the same
+  # deterministic containment the active response runs.
+  4*) echo "[NG-SOAR] Webhook rejected the request (HTTP ${HTTP_CODE}). The NG-SOAR"
+      echo "          engine expects a CACAO playbook document; this range's library"
+      echo "          is Ansible-style, so the orchestration call is not executed."
+      echo "[NG-SOAR] Containment does not depend on it: the NG-SIEM active response"
+      echo "          (rule 100103) is the authoritative route. Check, then enforce ON ${TARGET}:"
+      echo "          cat {{ puc2_isolation_marker }} {{ puc2_eradication_marker }}"
+      echo "          sudo /var/ossec/active-response/bin/puc2-isolate --now" ; exit 1 ;;
+  *)  echo "[NG-SOAR] Webhook error (HTTP ${HTTP_CODE}). Enforce containment ON ${TARGET}:"
+      echo "          sudo /var/ossec/active-response/bin/puc2-isolate --now" ; exit 1 ;;
+esac

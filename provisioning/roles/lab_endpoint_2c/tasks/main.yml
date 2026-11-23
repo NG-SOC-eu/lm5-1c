@@ -1,0 +1,386 @@
+---
+# =============================================================================
+# role: lab_endpoint_2c        (host: victim — runs AFTER the victim role)
+#
+# ADDITIVE OVERLAY. The substrate's `victim` role already installs and enrols
+# the Wazuh agent against hostvars['ng-siem'].ng_siem_internal_ip — this role
+# NEVER reinstalls or re-enrols it. The agent's version is fixed BEFORE the
+# substrate installs it, by puc2_agent_pin; this role only re-asserts that pin
+# and gates on the result (see "Agent version" below). On top of that it adds
+# what Sub Case 2c needs:
+#
+#   UML step 3  - FIM on the victim's Downloads dir so the payload drop emits
+#                 the file-hash telemetry rules 100100/100101 correlate
+#   UML step 10 - the puc2-isolate active-response script the manager invokes
+#   UML step 11 - the status markers puc2-isolate writes for the analyst
+#
+# Distinct blockinfile marker so it can never collide with the substrate.
+# =============================================================================
+
+- name: Assert the substrate victim role already installed the Wazuh agent
+  ansible.builtin.stat:
+    path: /var/ossec/etc/ossec.conf
+  register: puc2_agent_conf
+  failed_when: not puc2_agent_conf.stat.exists
+
+# ── Agent version: never newer than the manager ──────────────────────────────
+# The substrate installs "latest Wazuh agent" with no version. On 2026-09-14 that
+# was 4.14.7 against the siemng manager's 4.4.0, and Wazuh only guarantees
+# compatibility when the manager is at least as new as the agent. Enrolment on
+# 1515 still worked, then the manager closed every connection on 1514: `Never
+# connected`, no FIM telemetry, no 100101, no 100103, no containment.
+#
+# puc2_agent_pin fixes that BEFORE the substrate installs anything, in its own
+# play ahead of roles/victim. It is included again here so this role stands on
+# its own and has the manager version for the gate. What this role deliberately
+# no longer does is DOWNGRADE a newer agent in place: the downgrade keeps the
+# newer ossec.conf, which the older agent refuses to start on (see
+# puc2_agent_pin). A host that reaches this point with the wrong version fails
+# the gate instead, and the remedy is a fresh sandbox, not a repair.
+- name: Re-assert the agent pin and read the manager version
+  ansible.builtin.include_role:
+    name: puc2_agent_pin
+
+- name: Read the Wazuh agent version installed
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${Version}", wazuh-agent]
+  register: puc2_agent_pkg
+  changed_when: false
+
+- name: GATE — the agent is the pinned version, not newer than the manager
+  ansible.builtin.assert:
+    that:
+      - puc2_agent_pkg.stdout | trim == puc2_agent_target_version
+      - >-
+        (puc2_agent_pkg.stdout | trim | regex_replace('-.*$', ''))
+        is version(puc2_manager_version.stdout | trim, '<=')
+    fail_msg: >-
+      wazuh-agent is {{ puc2_agent_pkg.stdout | trim }}, but the pin says
+      {{ puc2_agent_target_version }} and the manager runs
+      {{ puc2_manager_version.stdout | trim }}. Either the pin play ahead of
+      roles/victim did not take effect and the substrate installed an unpinned
+      agent, or puc2_wazuh_agent_version names a version newer than the manager.
+      Do NOT downgrade in place - the older agent will not start on the newer
+      ossec.conf. Check /etc/apt/preferences.d/wazuh-agent and
+      `apt-cache policy wazuh-agent` on victim, then deploy a fresh sandbox.
+    success_msg: >-
+      wazuh-agent {{ puc2_agent_pkg.stdout | trim }} against manager
+      {{ puc2_manager_version.stdout | trim }}, installed at the pinned version.
+
+- name: Hold the agent there so no apt upgrade moves it
+  ansible.builtin.dpkg_selections:
+    name: wazuh-agent
+    selection: hold
+
+# ── The account that "receives" the phishing email ───────────────────────────
+- name: Create the victim user account
+  ansible.builtin.user:
+    name: "{{ puc2_victim_user }}"
+    shell: /bin/bash
+    create_home: true
+
+- name: Ensure the monitored Downloads directory exists
+  ansible.builtin.file:
+    path: "/home/{{ puc2_victim_user }}/Downloads"
+    state: directory
+    owner: "{{ puc2_victim_user }}"
+    group: "{{ puc2_victim_user }}"
+    mode: '0755'
+
+# ── FIM + firewall telemetry (UML steps 3 and 6) ─────────────────────────────
+# The <localfile> is what makes rule 100102 reachable: without an ingested
+# firewall source, the "blocked C2/exfil" branch of the correlation could never
+# fire. /var/log/kern.log is where the pre-staged iptables LOG rule below lands.
+- name: Enable FIM and firewall-log ingestion on the endpoint
+  ansible.builtin.blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    insertbefore: "</ossec_config>"
+    marker: "<!-- {mark} ANSIBLE MANAGED PUC2-2C FIM -->"
+    block: |
+      <syscheck>
+        <directories check_all="yes" realtime="yes" report_changes="yes">/home/{{ puc2_victim_user }}/Downloads</directories>
+        <directories check_all="yes" realtime="yes">/tmp</directories>
+      </syscheck>
+
+      <localfile>
+        <log_format>syslog</log_format>
+        <location>/var/log/kern.log</location>
+      </localfile>
+  register: puc2_fim_block
+
+# ── Pre-staged firewall rule producing that telemetry (UML step 6) ───────────
+# Installed BEFORE the exercise so the payload's C2 beacon is blocked AND
+# logged while the host is still healthy. This is ordinary egress filtering,
+# not containment: containment is what puc2-isolate adds on top later.
+- name: Deploy the baseline egress-filter unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/puc2-fw-baseline.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=PUC2 2c baseline egress filter (logs blocked C2 beacons)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # Idempotent: -C checks before -I inserts, so restarts do not stack rules.
+      ExecStart=/bin/bash -c '\
+        iptables -C OUTPUT -p tcp --dport {{ puc2_c2_port }} -j LOG --log-prefix "{{ puc2_fw_log_prefix }}: " --log-level 4 2>/dev/null || \
+        iptables -I OUTPUT -p tcp --dport {{ puc2_c2_port }} -j LOG --log-prefix "{{ puc2_fw_log_prefix }}: " --log-level 4; \
+        iptables -C OUTPUT -p tcp --dport {{ puc2_c2_port }} -j DROP 2>/dev/null || \
+        iptables -A OUTPUT -p tcp --dport {{ puc2_c2_port }} -j DROP'
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start the baseline egress filter
+  ansible.builtin.systemd:
+    name: puc2-fw-baseline
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Ensure kernel messages are written to /var/log/kern.log
+  ansible.builtin.service:
+    name: rsyslog
+    state: started
+    enabled: true
+  failed_when: false
+
+# ── Containment action invoked by the manager (UML steps 10-11) ──────────────
+- name: Ensure the active-response bin directory exists
+  ansible.builtin.file:
+    path: /var/ossec/active-response/bin
+    state: directory
+    owner: root
+    group: wazuh
+    mode: '0750'
+
+- name: Deploy the puc2-isolate active-response script
+  ansible.builtin.template:
+    src: puc2-isolate.j2
+    dest: /var/ossec/active-response/bin/puc2-isolate
+    owner: root
+    group: wazuh
+    mode: '0750'
+  register: puc2_ar_script
+
+- name: Ensure iptables is available for the containment action
+  ansible.builtin.apt:
+    name: iptables
+    state: present
+    update_cache: false
+
+# ── Start the agent on its configuration, and keep the reason if it will not ─
+# This used to be a handler, flushed here. On 2026-09-14 11:02 that handler
+# failed with "control process exited with error code" and nothing more: a
+# failing handler ends the host before any diagnostic task can run, and as the
+# only host of this play it took the whole playbook with it. A task inside a
+# block can be rescued, so the reason is collected where the failure happens.
+#
+# Restarted when the configuration it reads changed (the FIM block in ossec.conf
+# or the active-response script), otherwise only made sure to be running. The
+# egress-filter unit used to trigger a restart too; the agent never reads it.
+- name: Start the Wazuh agent on its configuration
+  block:
+    - name: Restart the agent if its configuration changed, else ensure it runs
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        state: "{{ 'restarted' if (puc2_fim_block is changed or puc2_ar_script is changed) else 'started' }}"
+        enabled: true
+        daemon_reload: true
+  rescue:
+    - name: Collect why wazuh-agent will not start
+      ansible.builtin.shell:
+        cmd: |
+          set +e
+          echo "=== package ==="
+          dpkg-query --show wazuh-agent 2>&1
+          echo "=== systemctl status wazuh-agent ==="
+          systemctl status wazuh-agent --no-pager -l 2>&1 | tail -25
+          echo "=== journalctl -u wazuh-agent, last 50 lines ==="
+          journalctl -u wazuh-agent --no-pager -n 50 2>&1
+          echo "=== agent ossec.log, today, errors only ==="
+          out=$(grep -a "$(date '+%Y/%m/%d')" /var/ossec/logs/ossec.log 2>/dev/null \
+            | grep -aiE 'error|critical|invalid|no such tag' | tail -30)
+          if [ -n "$out" ]; then echo "$out"; else echo "  (nothing from today)"; fi
+          echo "=== configuration test, wazuh-agentd -t ==="
+          /var/ossec/bin/wazuh-agentd -t 2>&1 | tail -15
+          echo "=== configuration test, wazuh-modulesd -t ==="
+          /var/ossec/bin/wazuh-modulesd -t 2>&1 | tail -15
+        executable: /bin/bash
+      register: puc2_agent_start_diag
+      changed_when: false
+      failed_when: false
+
+    - name: Show why wazuh-agent will not start
+      ansible.builtin.debug:
+        var: puc2_agent_start_diag.stdout_lines
+
+    - name: FAIL with the reason wazuh-agent will not start
+      ansible.builtin.fail:
+        msg: >-
+          wazuh-agent did not start on victim
+          ({{ ansible_failed_result.msg | default('no message') }}). The block
+          above holds systemd, the journal, the agent log and a configuration
+          test from both daemons: a "No such tag" or "Invalid element" line means
+          ossec.conf carries options this agent version does not know. Without a
+          running agent NG-SIEM gets no FIM telemetry, and levels L10, L11, L19
+          and L21 have nothing behind them.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IS THE AGENT ACTUALLY TALKING TO THE MANAGER?
+#
+# Everything this role configures is inert unless the agent connects. FIM on
+# Downloads produces the telemetry rules 100100/100101 correlate; if it never
+# arrives, 100103 cannot fire, containment never runs, and the markers L19/L21
+# grade are never written. Four training levels, one connection.
+#
+# On 2026-09-10 the agent was installed, enrolled and RUNNING, and the manager
+# said `ID: 002, Name: victim606, Never connected`. The endpoint reported
+# nothing wrong: `systemctl is-active` said started, and the scenario's own arm
+# script printed `[ OK ] Wazuh agent running (telemetry to NG-SIEM)` on the
+# strength of it. A process that is up is not a process that is connected, and
+# every check on this side had been asking the easy question.
+#
+# The manager-side gate in puc2_preflight catches this, but six plays later and
+# with only "Never connected" to show for it - the reason lives in the agent's
+# own log, on this host, and nothing collected it. So collect it here, where the
+# agent was just configured, and fail here with it in hand.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Give the agent a moment to complete its handshake
+  ansible.builtin.wait_for:
+    timeout: 20
+
+- name: Collect everything that explains an agent that will not connect
+  # `cmd:` form, NOT free-form `shell: |`. A free-form string goes through
+  # Ansible's split_args at PLAYBOOK LOAD, which knows nothing of bash comments:
+  # one apostrophe in a comment ("the image's build date") broke the parse and
+  # the 2026-09-14 deploy died before running a single task. yaml.safe_load and
+  # yamllint both accepted it. A dict-valued `cmd:` is never split.
+  ansible.builtin.shell:
+    cmd: |
+      set +e
+      echo "=== service ==="
+      systemctl is-active wazuh-agent 2>&1
+      systemctl is-enabled wazuh-agent 2>&1
+      echo "=== manager address the agent is configured with ==="
+      sed -n '/<client>/,/<\/client>/p' /var/ossec/etc/ossec.conf 2>&1 | grep -E '<address>|<port>|<protocol>' || echo "  (no <client> block)"
+      echo "=== enrolment ==="
+      if [ -s /var/ossec/etc/client.keys ]; then
+        awk '{print "  id="$1" name="$2" ip="$3}' /var/ossec/etc/client.keys
+      else
+        echo "  client.keys is EMPTY or missing - the agent was never enrolled"
+      fi
+      echo "=== can this host even reach the manager? ==="
+      for p in 1514 1515; do
+        timeout 5 bash -c "cat < /dev/null > /dev/tcp/{{ puc2_ng_siem_ip }}/$p" 2>/dev/null \
+          && echo "  {{ puc2_ng_siem_ip }}:$p reachable" \
+          || echo "  {{ puc2_ng_siem_ip }}:$p UNREACHABLE"
+      done
+      echo "=== what the agent itself says (today only) ==="
+      # -a because ossec.log carries non-UTF-8 bytes; date-scoped because this log
+      # is never rotated and would otherwise show the image build date.
+      grep -a "$(date '+%Y/%m/%d')" /var/ossec/logs/ossec.log 2>/dev/null \
+        | grep -aiE 'error|warn|unable|refus|timeout|connect|enroll' | tail -20 \
+        || echo "  (nothing from today)"
+    executable: /bin/bash
+  register: puc2_agent_diag
+  changed_when: false
+  failed_when: false
+
+- name: Show the agent's side of the connection
+  ansible.builtin.debug:
+    var: puc2_agent_diag.stdout_lines
+
+# ── GATE: the manager, not the endpoint, says whether the agent is connected ──
+# This used to end in a warning, on the reasoning that the authoritative answer
+# belongs to the manager and puc2_preflight asked it there. Both halves were
+# right and the result was still wrong: the 2026-09-14 build printed the warning
+# here, carried on for twelve more minutes, fired the rehearsal into an agent
+# that had never connected, and only then reached the manager-side gate. So ask
+# the manager from here, where the agent was just configured, and stop the build
+# with both sides of the connection in the log.
+#
+# By ID, from this host's client.keys: the name is a sequential hostname and the
+# IP is registered as `any`, so neither identifies the agent reliably.
+- name: Read the ID this agent enrolled under
+  ansible.builtin.command:
+    argv: [awk, 'NF && $1 !~ /^#/ { print $1; exit }', /var/ossec/etc/client.keys]
+  register: puc2_agent_id
+  changed_when: false
+  failed_when: false
+
+# Same rule as the preflight gate: blocking when the manager can answer, skipped
+# and said so when it cannot. This image has already dropped one binary the
+# roles assumed (wazuh-makelists).
+- name: Look for agent_control on the manager
+  ansible.builtin.stat:
+    path: /var/ossec/bin/agent_control
+  delegate_to: ng-siem
+  register: puc2_agent_control_bin
+
+- name: Wait for the manager to report this agent Active
+  ansible.builtin.command:
+    argv: [/var/ossec/bin/agent_control, -i, "{{ puc2_agent_id.stdout | trim }}"]
+  delegate_to: ng-siem
+  register: puc2_agent_status
+  changed_when: false
+  failed_when: false
+  until: puc2_agent_status.stdout | default('') is search('Status:\s+Active')
+  retries: "{{ puc2_agent_connect_retries }}"
+  delay: "{{ puc2_agent_connect_delay }}"
+  when:
+    - puc2_agent_control_bin.stat.exists
+    - puc2_agent_id.stdout | trim | length > 0
+
+# The other half of the diagnosis. The agent's log above only ever says the
+# connection closed; WHY it was refused (a version, a key) is written by
+# remoted and authd on the manager, which nothing collected on 2026-09-14.
+- name: Collect the manager's side of the connection
+  ansible.builtin.shell:
+    cmd: |
+      set +e
+      echo "=== manager version ==="
+      /var/ossec/bin/wazuh-control info 2>&1 | grep -a VERSION
+      echo "=== agent_control -i {{ puc2_agent_id.stdout | trim }} ==="
+      /var/ossec/bin/agent_control -i '{{ puc2_agent_id.stdout | trim }}' 2>&1
+      echo "=== remoted and authd on the manager (today only) ==="
+      out=$(grep -a "$(date '+%Y/%m/%d')" /var/ossec/logs/ossec.log 2>/dev/null \
+        | grep -aE 'wazuh-(remoted|authd)' | tail -25)
+      if [ -n "$out" ]; then echo "$out"; else echo "  (nothing from today)"; fi
+    executable: /bin/bash
+  delegate_to: ng-siem
+  register: puc2_manager_diag
+  changed_when: false
+  failed_when: false
+  when: puc2_agent_status.stdout | default('') is not search('Status:\s+Active')
+
+- name: Show the manager's side of the connection
+  ansible.builtin.debug:
+    var: puc2_manager_diag.stdout_lines
+  when: puc2_manager_diag is not skipped
+
+- name: GATE — the manager sees this agent Active
+  ansible.builtin.assert:
+    that:
+      - puc2_agent_id.stdout | trim | length > 0
+      - >-
+        (puc2_agent_status.stdout | default('') is search('Status:\s+Active'))
+        or not puc2_agent_control_bin.stat.exists
+    fail_msg: >-
+      The victim agent (ID '{{ puc2_agent_id.stdout | trim }}', wazuh-agent
+      {{ puc2_agent_pkg.stdout | trim }}) is not Active on the manager
+      (Wazuh {{ puc2_manager_version.stdout | trim }}) after
+      {{ (puc2_agent_connect_retries | int) * (puc2_agent_connect_delay | int) }} s.
+      Without it NG-SIEM gets no FIM telemetry: L10 has no alert, 100103 never
+      correlates, containment never runs and L19/L21 have no markers. An empty
+      ID means client.keys is empty and the agent never enrolled. Otherwise read
+      the two blocks above: the agent's own log on this host, and remoted/authd
+      on the manager, which name a refused version or key.
+    success_msg: >-
+      The manager reports agent {{ puc2_agent_id.stdout | trim }}
+      {{ 'Active' if puc2_agent_control_bin.stat.exists
+         else '(liveness unmeasurable: no agent_control on the manager; the rehearsal proves it)' }}.

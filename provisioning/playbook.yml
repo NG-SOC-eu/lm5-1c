@@ -1,0 +1,397 @@
+---
+# =============================================================================
+# One clock for the whole range, and the FIRST play of the file - before the
+# substrate, not merely before the overlay. Every timestamp written after it
+# is on the same scale: alerts, kern.log, active-responses.log, the command
+# logs forwarded off each node.
+#
+# It sat after the four substrate plays until 2026-09-10, which fixed the
+# clock but not their logs: kali stamped 14:20-14:21 through those four and
+# 12:22 from here on. Correcting a clock after things have written by it
+# leaves exactly that seam.
+#
+# Safe to run first: it takes no vars_files, reads no hostvars and depends on
+# no role - just timedatectl and date, on hosts systemd already runs.
+#
+# In the 2026-09-10 build kali ran two hours ahead of everything else: its tasks
+# closed at 09:15 while victim, ng-siem and docker-server closed at 07:15 UTC.
+# The image comes up on a local zone, the others on UTC. Nothing failed, which is
+# the problem — this is a SIEM training range whose entire Phase 2 is "correlate
+# these sources and place them on one timeline", and the analyst workstation was
+# contributing its syslog two hours in the future.
+#
+# Etc/UTC rather than a regional zone: the SIEM stores and the training text both
+# speak UTC, and a range that is torn down the same day has nothing to gain from
+# local time.
+- name: PUC2 2c — one clock across the range
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    # timedatectl rather than community.general.timezone: the collections in
+    # requirements.yml are installed by the platform, not by this repo, and the
+    # run log opens with "contains collections which will be ignored". Only
+    # community.docker is proven present by the substrate actually using it.
+    # Making the FIRST play of the whole file depend on an unproven collection
+    # would trade a two-hour clock skew for a deployment that cannot start, and
+    # nothing at all would run. systemd is on every node here and every other
+    # play already relies on it.
+    - name: Read the zone each node is currently on
+      ansible.builtin.command: date +%Z
+      register: puc2_tz_before
+      changed_when: false
+
+    - name: Put every node on UTC
+      ansible.builtin.command: timedatectl set-timezone Etc/UTC
+      when: puc2_tz_before.stdout | trim != 'UTC'
+      register: puc2_tz
+      changed_when: true
+
+    # Long-running loggers cache the zone at start, so they keep stamping the old
+    # offset until they are restarted. rsyslog is the one that matters: it is what
+    # ships each node's command log off the box. Restarted only where the timezone
+    # actually moved, and only where rsyslog is present at all.
+    - name: Restart rsyslog where the clock just moved under it
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      when: puc2_tz is changed
+      failed_when: false
+
+    - name: Read back the zone each node is now on
+      ansible.builtin.command: date +%Z
+      register: puc2_tz_now
+      changed_when: false
+
+    # Blocking: a node that silently refuses the change is a node whose logs will
+    # not line up with the SIEM's, and finding that out from a student's confused
+    # timeline is finding out too late.
+    - name: GATE — every node agrees on the clock
+      ansible.builtin.assert:
+        that:
+          - puc2_tz_now.stdout | trim == 'UTC'
+        fail_msg: >-
+          {{ inventory_hostname }} is on '{{ puc2_tz_now.stdout | trim }}', not UTC.
+          Its logs will not line up with NG-SIEM's on the incident timeline the
+          training asks trainees to reconstruct.
+        success_msg: "{{ inventory_hostname }} is on UTC."
+
+- name: Configuring Docker-Server
+  hosts: docker-server
+  become: yes
+  roles:
+    - docker_server
+
+- name: Configuring NG-SIEM
+  hosts: ng-siem
+  become: yes
+  # A PUC2 ruleset analysisd refuses does not degrade a training level, it stops
+  # wazuh-manager from starting — and then THIS play dies at its own "Restart
+  # wazuh-manager" long before the PUC2 role could deploy a corrected file. The
+  # range deadlocks: the bad file blocks the manager, and the fix cannot reach
+  # the host. ng_siem_rules_2c validates before restarting, but that only helps
+  # when the run gets that far. This is the other half of the guard, and it runs
+  # before anything asks the manager to start.
+  #
+  # No-op on a healthy range: it only acts when analysisd itself rejects the
+  # file, so a working ruleset is never touched.
+  pre_tasks:
+    - name: Look for a previously deployed PUC2 2c ruleset
+      ansible.builtin.stat:
+        path: /var/ossec/ruleset/rules/9999-puc2-2c.xml
+      register: puc2_prior_ruleset
+
+    - name: Ask analysisd whether it still accepts that ruleset
+      ansible.builtin.command: /var/ossec/bin/wazuh-analysisd -t
+      register: puc2_prior_t
+      changed_when: false
+      failed_when: false
+      when: puc2_prior_ruleset.stat.exists
+
+    - name: Remove a ruleset analysisd refuses, so the manager can start
+      ansible.builtin.file:
+        path: /var/ossec/ruleset/rules/9999-puc2-2c.xml
+        state: absent
+      when:
+        - puc2_prior_ruleset.stat.exists
+        - puc2_prior_t.rc | default(0) != 0
+          or 'ERROR' in (puc2_prior_t.stdout | default(''))
+          or 'CRITICAL' in (puc2_prior_t.stdout | default(''))
+          or 'ERROR' in (puc2_prior_t.stderr | default(''))
+          or 'CRITICAL' in (puc2_prior_t.stderr | default(''))
+  roles:
+    - ng-siem
+
+# The `kali` NODE stays: its address is the scenario's C2 (puc2_c2_ip derives
+# from it) and it is the candidate analyst workstation for the dashboards. Its
+# ROLE is gone — it installed Caldera and offensive tooling, and the PUC2 2c UML
+# has no attacker host at all; the Cyber Range performs the injection directly
+# on the endpoint. The node still gets the `all` role and sandbox-logging, which
+# is where its rsyslog fix lives.
+
+# =============================================================================
+# The second of the two overlay plays that run AHEAD of a substrate role, for
+# the same reason as the clock play at the top: it must be in place before the
+# substrate acts. roles/victim installs "latest Wazuh agent" with no version;
+# this pins apt to the manager's version first, so that untouched task installs
+# an agent the manager accepts. roles/puc2_agent_pin explains why a pin and not
+# a downgrade afterwards (67cb586 tried that, and the agent never started).
+#
+# After "Configuring NG-SIEM", because it reads the version off the manager.
+# =============================================================================
+- name: PUC2 2c — pin the endpoint's Wazuh agent to the manager's version
+  hosts: victim
+  become: true
+  gather_facts: false
+  vars_files:
+    - group_vars/puc2_2c.yml
+  roles:
+    - puc2_agent_pin
+
+- name: Configuring victim PC
+  hosts: victim
+  become: yes
+  roles:
+    - victim
+
+- name: Configure to all systems (logging, hosts, etc)
+  hosts: all
+  become: true
+  roles:
+    - all
+
+# The `man` node and its syslog-ng role are removed entirely: neither appears in
+# the PUC2 2c UML. The node is gone from topology.yml too, so this play would
+# have no hosts to run against.
+
+#- name: set up command logging
+#  hosts:
+#    - routers
+#    - hosts
+#  become: yes
+#  roles:
+#    - role: sandbox-logging
+#      slf_destination_port: '{% if hostvars["man"] is defined -%} 514 {%- else -%} 515 {%- endif %}'
+#      when: ansible_system == "Linux"
+
+# =============================================================================
+# PUC2 (CYNET) — Sub Case 2c overlay
+# -----------------------------------------------------------------------------
+# Everything above this line is the ng-soc-ansible@integrations substrate —
+# with TWO exceptions, both ours. The one-clock play at the very top leads the
+# file because a clock corrected after the substrate has written by it leaves a
+# seam in the logs. The agent-pin play just before "Configuring victim PC" sits
+# there because apt must see the pin before the substrate installs the Wazuh
+# agent. Neither touches anything else. Everything below is the ADDITIVE
+# scenario overlay: it never modifies a
+# substrate role and it always runs AFTER them, so the MISP / custom-iris
+# integrations injected into ossec.conf by the ng-siem role are already in place
+# (the overlay uses distinct blockinfile markers).
+#
+# Ordering contract:
+#   docker-server (facts: misp_api_key, iris_api_key, docker_server_internal_ip)
+#   -> ng-siem (integrations)  -> ng_siem_rules_2c  -> lab_endpoint_2c
+#   -> cti_ss_2c / cicms_2c / soar_actions_2c       -> evaluation_reporting
+#
+# group_vars/puc2_2c.yml is loaded explicitly: the topology declares
+# `groups: []`, so a group_vars file would never be auto-loaded. vault.yml is
+# git-ignored, so the example file is used when it is absent.
+# =============================================================================
+
+- name: PUC2 2c — NG-SIEM detection rules and active-response wiring (steps 3-6, 9-10)
+  hosts: ng-siem
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - ng_siem_rules_2c
+
+- name: PUC2 2c — endpoint FIM, containment action and scenario staging (steps 1-3, 10, 11)
+  hosts: victim
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - lab_endpoint_2c
+    # The Cyber Range injects into the endpoint (UML steps 1-2). Provisioning
+    # only STAGES it; the attack itself is tagged `never` and fires only with
+    # --tags puc2-inject. Ordered after lab_endpoint_2c so FIM and the active
+    # response already exist when the payload lands.
+    - scenario_injection_2c
+
+- name: PUC2 2c — CTI-SS seeding, CICMS template, NG-SOAR action library (steps 4, 7, 8, 12)
+  hosts: docker-server
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - cti_ss_2c
+    - cicms_2c
+    - soar_actions_2c
+    - puc2_credentials
+
+- name: PUC2 2c — evaluation and reporting collateral (step 13)
+  hosts: ng-siem
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - evaluation_reporting
+
+# =============================================================================
+# Node access — the training runs `sudo` on the nodes and opens their consoles;
+# the base images ask for credentials the trainee was never given. Give the
+# management user a known password and passwordless sudo, on every node the
+# trainee touches (kali is here for its analyst desktop). The management user is
+# `debian` on kali and `ubuntu` elsewhere.
+# =============================================================================
+- name: PUC2 2c — node login and sudo for the trainee
+  hosts: victim,ng-siem,docker-server,kali
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - role: puc2_node_access
+      vars:
+        puc2_node_mgmt_user: "{{ 'debian' if inventory_hostname in ['kali', 'router'] else 'ubuntu' }}"
+
+# =============================================================================
+# Rehearsal — PART OF EVERY BUILD, placed right before the preflight gate so a
+# deployment fires the chain, verifies it, self-cleans, and then re-proves the
+# gate green without anyone typing a second command.
+#
+# It used to be tagged `never`. That made the deployment's strongest check the
+# one nobody ran: the gate below proves STATICALLY that rules 100101/100103 are
+# on disk and that the watchlist carries the hash, but only firing the scenario
+# proves 100101 actually alerts (L10), that 100103 correlates (L11/L12) and that
+# the active response writes the markers (L19/L20/L21). The 2026-09-10 build
+# shipped green with that whole chain unexercised — analysisd had only ever been
+# asked about 100102. A check that is opt-in is a check that is absent.
+#
+# Unlike the preflight gate (which only ARMS the scenario), this fires the real
+# attack and watches 100101 -> 100102 -> 100103 -> active response -> markers ->
+# quarantine in runtime, then removes every trace so the range is handed to the
+# student exactly as provisioning left it. No any_errors_fatal: a broken link
+# must still reach the always-cleanup.
+#
+# To skip it (a smoke deploy, a re-run against a live class):
+#   ansible-playbook provisioning/playbook.yml -e puc2_rehearsal_enabled=false
+# Skipping is a clean skip, not a failure — and it says so in the log, because
+# the range then ships with the runtime chain unproven.
+# =============================================================================
+- name: PUC2 2c — rehearsal, fire the chain end to end then self-clean
+  hosts: ng-siem,victim,docker-server
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - role: puc2_rehearsal
+      tags: [puc2_rehearsal, puc2-rehearsal]
+
+# =============================================================================
+# QA gate — runs last, fails the deployment if the range cannot answer its own
+# training. Read-only: it arms the scenario (the script's read-only mode) and
+# reads back the live services; it never fires the attack.
+#
+#   ansible-playbook provisioning/playbook.yml --tags puc2-preflight
+#
+# to re-run just the gate against an already-provisioned sandbox.
+# =============================================================================
+- name: PUC2 2c — preflight, every graded training answer must be obtainable
+  # kali is in the gate because the training's access primer sends every trainee
+  # there for the four SOC dashboards: it is the only node whose image ships a
+  # desktop, and the dashboards live on testnet addresses no outside browser can
+  # reach. Nothing in the 2026-09-10 build checked that kali had a browser, a
+  # graphical session, or a route to any of the four — the role that would have
+  # (puc2_access_probe) was tagged `never`.
+  hosts: ng-siem,victim,docker-server,kali
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - role: puc2_preflight
+      tags: [puc2-preflight]
+
+# =============================================================================
+# Diagnostics — read-only, opt-in, NEVER part of a build (tagged `never`).
+#
+#   ansible-playbook provisioning/playbook.yml --tags puc2_diag --limit docker-server
+#
+# Asks CTI-SS and CICMS directly whether the scenario content is there, and
+# writes diagnostics/DIAGNOSIS.md with the HTTP status and the API's own words
+# for each resource. Creates nothing; cannot fail a build.
+# =============================================================================
+- name: PUC2 2c — diagnose the CTI-SS / CICMS content against the live APIs
+  hosts: docker-server
+  become: true
+  # A `never`-tagged play still runs its implicit "Gathering Facts" task on every
+  # build — the 2026-09-10 log shows both diagnostic plays gathering facts and
+  # then executing zero tasks. No task in puc2_diag reads a gathered fact (the
+  # addresses it uses come from role-set facts and the group_vars fallbacks), so
+  # there is nothing to gather. Set this back to true if that stops being so.
+  gather_facts: false
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - role: puc2_diag
+      tags: [puc2_diag, puc2-diag, never]
+
+# =============================================================================
+# Access probe — read-only, opt-in, NEVER part of a build (tagged `never`).
+#
+#   ansible-playbook provisioning/playbook.yml \
+#     --tags puc2_access_probe -e puc2_access_probe_enabled=true
+#
+# Reports, per node, whether a browser and desktop are present and which SOC
+# dashboards it can reach, and writes diagnostics/ACCESS-PROBE-RESULTS.md. Fills
+# the "CONFIRM IN SANDBOX" cells of ACCESS-MATRIX.md with live data. Installs
+# nothing; cannot fail a build.
+# =============================================================================
+- name: PUC2 2c — probe each node for desktop, browser and dashboard reachability
+  hosts: all
+  become: true
+  # Same reason as the diagnosis play above, across ALL seven hosts this time.
+  # Keyed on the probe's own switch rather than hardcoded false: when the probe
+  # is actually asked for, it gets a normal fact-gathering play, so anything
+  # added to it later behaves as expected.
+  gather_facts: "{{ puc2_access_probe_enabled | default(false) | bool }}"
+  vars_files:
+    - group_vars/puc2_2c.yml
+    - "{{ lookup('first_found', ['group_vars/vault.yml', 'group_vars/vault.yml.example']) }}"
+  roles:
+    - role: puc2_access_probe
+      tags: [puc2_access_probe, puc2-access-probe, never]
+
+
+# --- Change man syslog-ng and adding Command Logging
+- name: Changing syslog-ng on man
+  hosts: man
+  become: yes
+  roles:
+    - man
+
+- name: set up command logging
+  hosts: 
+    - routers
+    - hosts
+  roles:
+    - role: sandbox-logging
+      become: yes
+      slf_destination_port: '{% if hostvars["man"] is defined -%} 514 {%- else -%} 515 {%- endif %}'
+      when: ansible_system == "Linux"

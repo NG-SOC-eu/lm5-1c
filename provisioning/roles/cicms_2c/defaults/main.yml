@@ -1,0 +1,21 @@
+---
+# role: cicms_2c (CICMS = DFIR-IRIS, deployed by the substrate docker_server role)
+# Fallbacks only. The authoritative values live in group_vars/puc2_2c.yml.
+puc2_iris_assets_dir: "/opt/cicms-assets"
+puc2_iris_url: "https://127.0.0.1:8083"
+puc2_iris_api_key: "CHANGE_ME"
+puc2_misp_url: "https://127.0.0.1:8443"
+puc2_misp_sharing_group_name: "NG-SOC-PUC2"
+puc2_soar_webhook_url: "http://127.0.0.1:8080/trigger/playbook"
+puc2_ng_siem_ip: "10.0.16.70"
+puc2_victim_ip: "10.0.16.100"
+puc2_c2_ip: "10.0.16.50"
+puc2_c2_domain: "c2.puc2-training.lab"
+puc2_payload_name: "invoice.exe"
+puc2_payload_md5: "44d88612fea8a8f36de82e1278abb02f"
+puc2_isolation_marker: "/var/run/ngsoar_isolated"
+puc2_eradication_marker: "/var/run/ngsoar_eradication_status"
+puc2_c2_port: 4444
+puc2_case_soc_id: "CASE-PUC2-2C"
+puc2_mitre_initial_access: "T1566.001"
+puc2_mitre_execution: "T1204.002"

@@ -1,0 +1,266 @@
+#!/bin/bash
+# =============================================================================
+# puc2-isolate — Wazuh 4.x active-response script (PUC2 CYNET Sub Case 2c)
+#
+# Rendered by role lab_endpoint_2c onto the victim endpoint. Launched by the
+# wazuh-manager on ng-siem when rule {{ puc2_active_response_rules }} fires
+# (location=local), i.e. UML steps 9 -> 10, and it writes the status markers
+# read back for UML step 11.
+#
+# It PORTS the logic of the four NG-SOAR containment playbooks kept as a
+# library in provisioning/roles/soar_actions_2c/files/:
+#   isolate_host.yml        -> network isolation (SOC subnet stays reachable)
+#   block_malicious_ip.yml  -> drop C2 traffic + blackhole the C2 domain
+#   quarantine_and_patch.yml-> quarantine the payload
+#   reset_credentials.yml   -> expire the compromised account's password
+#
+# Wazuh 4.x AR protocol: the alert arrives as one JSON object on stdin, with a
+# "command" field of "add" (execute) or "delete" (rollback).
+# =============================================================================
+set -uo pipefail
+
+LOG_FILE="/var/ossec/logs/active-responses.log"
+SANDBOX_CIDR="{{ puc2_sandbox_cidr }}"
+C2_DOMAIN="{{ puc2_c2_domain }}"
+C2_IP="{{ puc2_c2_ip }}"
+VICTIM_USER="{{ puc2_victim_user }}"
+PAYLOAD_NAME="{{ puc2_payload_name }}"
+QUARANTINE_DIR="{{ puc2_quarantine_dir }}"
+ISOLATION_MARKER="{{ puc2_isolation_marker }}"
+ERADICATION_MARKER="{{ puc2_eradication_marker }}"
+SSH_PORT="{{ puc2_admin_ssh_port }}"
+
+log() {
+    echo "$(date '+%Y/%m/%d %H:%M:%S') active-response/bin/puc2-isolate: $*" >>"${LOG_FILE}"
+}
+
+# ---- Idempotent firewall changes --------------------------------------------
+# Containment runs more than once per attack: rule {{ puc2_active_response_rules }}
+# matches once per repeated IOC, so a single delivery fires this script twice.
+# It used to insert every rule unconditionally, and rollback deleted one copy of
+# each. A second "-d ${C2_IP} -j DROP" therefore survived every rollback, at the
+# top of OUTPUT, above the baseline egress filter's LOG rule. The next trainee's
+# C2 beacon was dropped there in silence, never logged, and rule 100102 never
+# fired. On victim619 (2026-10-11) the OUTPUT chain held five copies.
+# add_rule inserts or appends only when the rule is absent; del_rule removes
+# every copy, so rollback returns the chain to the baseline whatever it holds.
+add_rule() {   # add_rule -I|-A CHAIN rule-spec...
+    local op="$1" chain="$2"; shift 2
+    iptables -C "${chain}" "$@" 2>/dev/null || iptables "${op}" "${chain}" "$@"
+}
+del_rule() {   # del_rule CHAIN rule-spec...
+    local chain="$1"; shift
+    while iptables -D "${chain}" "$@" 2>/dev/null; do :; done
+}
+
+# ---- Determine the AR command ----------------------------------------------
+# Two entry points, one containment:
+#   * Wazuh manager (rule {{ puc2_active_response_rules }}, UML steps 9-10): the
+#     alert arrives as one JSON object on stdin with a "command" of "add"/"delete".
+#     This is the automatic path and stays the authoritative one.
+#   * Operator, on the endpoint: `puc2-isolate --now` isolates, `--lift` rolls
+#     back. This gives the NG-SOAR containment of training level L18 a
+#     deterministic console fallback, so the L19/L21 status markers are
+#     guaranteed to exist without waiting on the automatic trigger. It reads no
+#     stdin, so it never hangs a terminal.
+case "${1:-}" in
+    --now|--manual|--isolate)
+        COMMAND="add"
+        log "manual containment requested from the endpoint (operator fallback for L18)"
+        ;;
+    --lift|--rollback|--delete)
+        COMMAND="delete"
+        ;;
+    *)
+        read -r INPUT_JSON
+        COMMAND=$(printf '%s' "${INPUT_JSON}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("command",""))' 2>/dev/null)
+        if [ -z "${COMMAND}" ]; then
+            # Fallback parse when python3 is unavailable.
+            COMMAND=$(printf '%s' "${INPUT_JSON}" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')
+        fi
+        ;;
+esac
+
+# =============================================================================
+# ROLLBACK (command = delete)
+# =============================================================================
+if [ "${COMMAND}" = "delete" ]; then
+    log "rollback requested — lifting containment"
+    iptables -P INPUT ACCEPT  2>/dev/null
+    iptables -P OUTPUT ACCEPT 2>/dev/null
+    # Every rule step 1 and 2 below can add, every copy of it. The baseline
+    # egress filter (LOG + DROP on tcp/{{ puc2_c2_port }}) is not containment and stays.
+    del_rule OUTPUT -d "${C2_IP}" -j DROP
+    del_rule INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    del_rule OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    del_rule INPUT  -i lo -j ACCEPT
+    del_rule OUTPUT -o lo -j ACCEPT
+    del_rule INPUT  -s "${SANDBOX_CIDR}" -j ACCEPT
+    del_rule OUTPUT -d "${SANDBOX_CIDR}" -j ACCEPT
+    del_rule INPUT  -p tcp --dport "${SSH_PORT}" -m conntrack --ctstate NEW -j ACCEPT
+    del_rule OUTPUT -p tcp --sport "${SSH_PORT}" -j ACCEPT
+    sed -i "/[[:space:]]${C2_DOMAIN}\$/d" /etc/hosts 2>/dev/null
+    rm -f "${ISOLATION_MARKER}" "${ERADICATION_MARKER}"
+    log "containment lifted"
+    exit 0
+fi
+
+if [ "${COMMAND}" != "add" ]; then
+    log "unknown or empty command '${COMMAND}' — nothing to do"
+    exit 0
+fi
+
+log "containment triggered (UML steps 9-10)"
+
+# =============================================================================
+# 1. NETWORK ISOLATION  (ports isolate_host.yml)
+#    Everything is dropped EXCEPT the flat sandbox subnet, so the Wazuh agent
+#    keeps reporting to NG-SIEM and the SOC control channel survives.
+# =============================================================================
+add_rule -I INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+add_rule -I OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+add_rule -I INPUT  -i lo -j ACCEPT
+add_rule -I OUTPUT -o lo -j ACCEPT
+add_rule -A INPUT  -s "${SANDBOX_CIDR}" -j ACCEPT
+add_rule -A OUTPUT -d "${SANDBOX_CIDR}" -j ACCEPT
+
+# ---- Preserve the administrative control channel ---------------------------
+# Real host isolation keeps an out-of-band path for the responder; here it is
+# also what keeps the exercise playable. The trainee (and the evidence
+# collector of UML step 13) reaches this endpoint over SSH through the
+# CyberRangeCZ management interface, which is NOT part of ${SANDBOX_CIDR}:
+# with a bare DROP policy every RECONNECT would be refused and training levels
+# L20/L22 — "read the containment markers on victim" — become unanswerable.
+# The already-open session survives on the conntrack rule above; these two make
+# a new one possible. Isolation of the malware's own traffic is unaffected: the
+# payload does not listen on tcp/${SSH_PORT}.
+add_rule -A INPUT  -p tcp --dport "${SSH_PORT}" -m conntrack --ctstate NEW -j ACCEPT
+add_rule -A OUTPUT -p tcp --sport "${SSH_PORT}" -j ACCEPT
+
+iptables -P INPUT  DROP
+iptables -P OUTPUT DROP
+log "network isolation applied (allow-list: ${SANDBOX_CIDR}, admin channel tcp/${SSH_PORT} preserved)"
+
+# =============================================================================
+# 2. BLOCK MALICIOUS INFRASTRUCTURE  (ports block_malicious_ip.yml)
+#    The attacker host sits inside the sandbox CIDR allowed above, so it needs
+#    an explicit DROP inserted ahead of that allow rule.
+# =============================================================================
+add_rule -I OUTPUT -d "${C2_IP}" -j DROP
+# The scenario pre-seeds "${C2_IP} ${C2_DOMAIN}" in /etc/hosts as a sinkhole so
+# the beacon is observable before containment. REPLACE that line rather than
+# appending: with two entries the first one wins, and the first would still be
+# the live C2 address — containment would look applied and do nothing.
+sed -i "/[[:space:]]${C2_DOMAIN}\$/d" /etc/hosts 2>/dev/null
+echo "0.0.0.0 ${C2_DOMAIN}" >>/etc/hosts
+log "blocked C2 infrastructure: ${C2_IP} / ${C2_DOMAIN} (sinkhole rewritten to 0.0.0.0)"
+
+# =============================================================================
+# 3. QUARANTINE THE PAYLOAD  (ports quarantine_and_patch.yml)
+# =============================================================================
+mkdir -p "${QUARANTINE_DIR}"
+chmod 0700 "${QUARANTINE_DIR}"
+QUARANTINED=0
+for candidate in \
+{% for p in puc2_delivery_paths %}
+    "{{ p }}" \
+{% endfor %}
+    "/home/${VICTIM_USER}/${PAYLOAD_NAME}" \
+    "/tmp/payload.sh"; do
+    if [ -e "${candidate}" ]; then
+        mv -f "${candidate}" "${QUARANTINE_DIR}/" 2>/dev/null && {
+            QUARANTINED=$((QUARANTINED + 1))
+            log "quarantined ${candidate}"
+        }
+    fi
+done
+chmod -R 0600 "${QUARANTINE_DIR}"/* 2>/dev/null
+
+# Eradication is a STATE, not an event. This action is re-runnable by design:
+# rule {{ puc2_active_response_rules }} can match more than once, and training
+# level L18 tells the trainee to fire containment again from NG-SOAR while the
+# phase text promises that doing so is "safe and idempotent". On that second run
+# there is nothing left to move, so a status derived from THIS run's move count
+# alone would rewrite the marker to "incomplete" — and level L21's graded answer
+# would vanish the moment the trainee did what the training asked. What matters
+# is whether the payload is in quarantine, not who put it there.
+QUARANTINE_HELD=$(ls -A "${QUARANTINE_DIR}" 2>/dev/null | wc -l)
+
+# Kill anything still executing the payload.
+pkill -f "${PAYLOAD_NAME}" 2>/dev/null
+
+# =============================================================================
+# 4. RESET COMPROMISED CREDENTIALS  (ports reset_credentials.yml)
+#    Expire the password and drop live sessions. A replacement hash is NEVER
+#    baked into this script; NG-SOAR supplies one out of band when required.
+# =============================================================================
+if id "${VICTIM_USER}" >/dev/null 2>&1; then
+    chage -d 0 "${VICTIM_USER}" 2>/dev/null && log "expired password for ${VICTIM_USER}"
+    pkill -KILL -u "${VICTIM_USER}" 2>/dev/null
+fi
+
+# =============================================================================
+# 5. APPLY SECURITY UPDATES  (ports quarantine_and_patch.yml)
+#    6.3.2.3: "threat elimination playbooks ... quarantine endpoints and apply
+#    security updates". Run DETACHED: an apt run can take minutes and an active
+#    response that blocks that long would be killed by the manager. Note the
+#    host is already isolated at this point, so this only succeeds against
+#    reachable mirrors inside the sandbox — the outcome is recorded honestly in
+#    the eradication marker rather than assumed.
+# =============================================================================
+PATCH_LOG="/var/log/puc2-security-updates.log"
+if command -v apt-get >/dev/null 2>&1; then
+    nohup setsid bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        {
+          echo \"=== puc2-isolate security update run: \$(date -Iseconds) ===\"
+          apt-get update -q && apt-get -y -q --only-upgrade dist-upgrade
+          echo \"exit=\$?\"
+        } >>'${PATCH_LOG}' 2>&1
+    " >/dev/null 2>&1 &
+    PATCH_STATUS="triggered_background (see ${PATCH_LOG})"
+    log "security update run triggered in background"
+else
+    PATCH_STATUS="skipped_no_apt"
+fi
+
+# =============================================================================
+# 6. STATUS MARKERS  (feed UML step 11: containment & eradication status)
+# =============================================================================
+# First line is the graded answer for training level L19 — keep it verbatim.
+cat >"${ISOLATION_MARKER}" <<MARKER
+{{ puc2_isolation_status }}
+isolated_by=ng_soar/puc2-isolate
+isolated_at=$(date -Iseconds)
+allow_cidr=${SANDBOX_CIDR}
+admin_channel=tcp/${SSH_PORT} (preserved)
+blocked_ip=${C2_IP}
+blocked_domain=${C2_DOMAIN}
+MARKER
+
+# First line is the graded answer for training level L21 — keep it verbatim.
+# It reports {{ puc2_eradication_status }} when the payload is held in
+# quarantine, whether this run moved it or an earlier one did. The multi-stage
+# delivery guarantees at least one artefact, so the "incomplete" value can only
+# mean the injection never ran — which is worth seeing, and is the one case
+# where it is the honest answer.
+if [ "${QUARANTINED}" -gt 0 ] || [ "${QUARANTINE_HELD}" -gt 0 ]; then
+    ERADICATION_STATUS="{{ puc2_eradication_status }}"
+else
+    ERADICATION_STATUS="eradication_incomplete_no_payload_found"
+fi
+
+cat >"${ERADICATION_MARKER}" <<MARKER
+${ERADICATION_STATUS}
+quarantine_dir=${QUARANTINE_DIR}
+quarantined_this_run=${QUARANTINED}
+quarantined_total=${QUARANTINE_HELD}
+credentials_reset=$(id "${VICTIM_USER}" >/dev/null 2>&1 && echo yes || echo n/a)
+security_updates=${PATCH_STATUS}
+eradicated_at=$(date -Iseconds)
+MARKER
+
+chmod 0644 "${ISOLATION_MARKER}" "${ERADICATION_MARKER}"
+log "containment complete — ${QUARANTINED} artefact(s) quarantined (UML step 11)"
+exit 0

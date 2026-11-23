@@ -1,0 +1,277 @@
+---
+# CTI-SS / CICMS / NG-SOAR side of the gate. These are the four answers the QA
+# report could only mark "created via API, high confidence, close off with a
+# glance at the dashboard" — L9, L14, L15, L24 (plus L26). Here they are read
+# back from the live services, so the glance is no longer anyone's homework.
+#
+# WHAT WENT WRONG THE FIRST TIME, AND WHY IT IS WRITTEN LIKE THIS NOW
+# These three reads once omitted `return_content: true`. ansible.builtin.uri
+# then returns no `content` key at all, `content | default('')` yields the empty
+# string, and every `X in ''` is False. The gate failed a build while reporting
+# three things it had never actually looked at, and it would have failed an
+# intact sandbox identically. So:
+#   * every read sets return_content and accepts ONLY 200 — a read that did not
+#     happen must fail as a read, not quietly become "resource missing";
+#   * the assert distinguishes "the service said no" from "the service did not
+#     answer", because those need different fixes from the operator;
+#   * the case is matched on its case_soc_id FIELD via cicms_2c's find_case,
+#     not by substring over the whole list body.
+
+# Holds the same proven key the creating roles used — and fails the deployment
+# if either service rejects it, which is precisely the failure this gate could
+# not previously see.
+- name: Resolve and prove the CTI-SS / CICMS credentials
+  ansible.builtin.include_role:
+    name: puc2_keys
+
+- name: Read back the PUC2 2c event from CTI-SS
+  ansible.builtin.uri:
+    url: "{{ puc2_misp_url }}/events/restSearch"
+    method: POST
+    headers:
+      Authorization: "{{ puc2_misp_api_key }}"
+      Accept: "application/json"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      value: "{{ puc2_payload_md5 }}"
+      returnFormat: "json"
+    return_content: true
+    validate_certs: false
+    status_code: [200]
+    timeout: 30
+  register: puc2_pf_misp_event
+  no_log: true
+  failed_when: false
+  # Wait for an answer before judging the content. Failing the deployment
+  # because a service was still warming up would make this gate exactly the
+  # blocker it exists to prevent.
+  retries: 10
+  delay: 6
+  until: puc2_pf_misp_event.status | default(0) == 200
+
+- name: Read back the CTI-SS sharing groups
+  ansible.builtin.uri:
+    url: "{{ puc2_misp_url }}/sharing_groups/index"
+    method: GET
+    headers:
+      Authorization: "{{ puc2_misp_api_key }}"
+      Accept: "application/json"
+    return_content: true
+    validate_certs: false
+    status_code: [200]
+    timeout: 30
+  register: puc2_pf_misp_groups
+  no_log: true
+  failed_when: false
+  retries: 10
+  delay: 6
+  until: puc2_pf_misp_groups.status | default(0) == 200
+
+- name: Read back the scenario case from CICMS by its SOC id
+  ansible.builtin.include_role:
+    name: cicms_2c
+    tasks_from: find_case.yml
+
+# ── No PUC2 detection case may be waiting for the trainee ────────────────────
+# custom-iris turns every NG-SIEM alert into a CICMS case. A case for rules
+# 100100-100103 that exists before the trainee fires the scenario is an answer
+# key: on 2026-09-14 12:30 case_lookup.sh (the L14 helper) listed
+# "[100101] PUC2: file hash matches CTI-SS malware IOC" after the rehearsal. It
+# also blocks the real exercise, because custom-iris deduplicates on a soc_id
+# that is the same every run, so the trainee's own attack would create nothing.
+# Matched on the soc_id prefix and on the [rule] tag in the name, so either
+# field alone is enough. The rows come from find_case above.
+- name: Find CICMS cases raised by the PUC2 detection rules
+  ansible.builtin.set_fact:
+    puc2_pf_spoiler_cases: >-
+      {{ ((puc2_case_rows | default([]) | selectattr('case_soc_id', 'string')
+           | selectattr('case_soc_id', 'match', '^WAZUH-1001(00|01|02|03)-') | list)
+          + (puc2_case_rows | default([]) | selectattr('case_name', 'string')
+           | selectattr('case_name', 'search', '\[1001(00|01|02|03)\]') | list))
+         | map(attribute='case_name') | unique | join(' / ') }}
+
+- name: List the NG-SOAR containment library
+  ansible.builtin.find:
+    paths: "{{ puc2_soar_playbook_dir }}"
+    patterns: "*.yml"
+  register: puc2_pf_soar
+
+- name: Collect the service responses as plain text
+  ansible.builtin.set_fact:
+    puc2_pf_event: "{{ puc2_pf_misp_event.content | default('') | string }}"
+    puc2_pf_groups: "{{ puc2_pf_misp_groups.content | default('') | string }}"
+    puc2_pf_books: "{{ puc2_pf_soar.files | default([]) | map(attribute='path') | map('basename') | list }}"
+    # A read that never returned a body cannot support any conclusion about the
+    # resource. Naming that state separately is what stops an unanswered service
+    # from being reported as an empty one.
+    puc2_pf_event_read: "{{ puc2_pf_misp_event.content is defined }}"
+    puc2_pf_groups_read: "{{ puc2_pf_misp_groups.content is defined }}"
+    puc2_pf_event_status: "{{ puc2_pf_misp_event.status | default('unreachable') }}"
+    puc2_pf_groups_status: "{{ puc2_pf_misp_groups.status | default('unreachable') }}"
+  no_log: true
+
+- name: Count the events the read actually returned
+  ansible.builtin.set_fact:
+    puc2_pf_events: "{{ puc2_pf_misp_event.json.response | default([], true)
+                        | selectattr('Event', 'defined') | map(attribute='Event') | list }}"
+  no_log: true
+
+- name: Establish that the event is published
+  ansible.builtin.set_fact:
+    puc2_pf_event_published: "{{ puc2_pf_events | selectattr('published', 'defined')
+                                 | selectattr('published', 'in', [true, 1, '1'])
+                                 | list | length > 0 }}"
+  no_log: true
+
+- name: GATE — CTI-SS, CICMS and the NG-SOAR library answer their levels
+  ansible.builtin.assert:
+    that:
+      # The reads themselves happened. Without this, a rejected key or a
+      # container that is not answering looks exactly like missing content.
+      - puc2_pf_event_read
+      - puc2_pf_groups_read
+      # L9 and L26: the ATT&CK techniques the trainee reads off the event
+      - puc2_mitre_initial_access in puc2_pf_event
+      - puc2_mitre_execution in puc2_pf_event
+      # L15: the C2 domain IOC pulled into the IRIS case
+      - puc2_c2_domain in puc2_pf_event
+      # L8: the hash that ties the event to the NG-SIEM watchlist
+      - puc2_payload_md5 in puc2_pf_event
+      # L20: the C2 address the trainee submits. It reaches them through this
+      # event's ip-dst attribute and the firewall log; if the event carries a
+      # different address than the one the range actually uses, the graded
+      # answer and the evidence disagree.
+      - puc2_c2_ip in puc2_pf_event
+      # L24: intel that was never published was never shared
+      - puc2_pf_event_published
+      # L24: the sharing group published into
+      - puc2_misp_sharing_group_name in puc2_pf_groups
+      # L14: the scenario case, matched on its SOC id field
+      - puc2_case_found
+      # L10/L11/L25: no PUC2 detection case left from a rehearsal or a class
+      - puc2_pf_spoiler_cases | length == 0
+      # L18: the playbook name read off the library listing
+      - "'isolate_host.yml' in puc2_pf_books"
+      - "'block_malicious_ip.yml' in puc2_pf_books"
+      - "'reset_credentials.yml' in puc2_pf_books"
+      - "'quarantine_and_patch.yml' in puc2_pf_books"
+    fail_msg: >-
+      CTI-SS / CICMS preflight FAILED — trainees would hit a blocking level.
+      MISP event read: HTTP {{ puc2_pf_event_status }}, body returned:
+      {{ puc2_pf_event_read }}, events matched: {{ puc2_pf_events | length }};
+      carries {{ puc2_mitre_initial_access }}:
+      {{ puc2_mitre_initial_access in puc2_pf_event }},
+      {{ puc2_mitre_execution }}: {{ puc2_mitre_execution in puc2_pf_event }},
+      C2 IOC {{ puc2_c2_domain }}: {{ puc2_c2_domain in puc2_pf_event }},
+      hash {{ puc2_payload_md5 }}: {{ puc2_payload_md5 in puc2_pf_event }},
+      C2 address {{ puc2_c2_ip }}: {{ puc2_c2_ip in puc2_pf_event }},
+      published: {{ puc2_pf_event_published }}.
+      Sharing groups read: HTTP {{ puc2_pf_groups_status }}, body returned:
+      {{ puc2_pf_groups_read }}; {{ puc2_misp_sharing_group_name }} present:
+      {{ puc2_misp_sharing_group_name in puc2_pf_groups }}.
+      CICMS case {{ puc2_case_soc_id }}: {{ puc2_case_found }}
+      ({{ puc2_case_lookup }}).
+      PUC2 detection cases already in CICMS:
+      {{ puc2_pf_spoiler_cases if (puc2_pf_spoiler_cases | default('') | length > 0)
+         else '(none)' }}
+      (any of these gives away the L10 answer before the trainee fires the
+      scenario, and makes custom-iris skip the trainee's own cases; the
+      rehearsal deletes the ones it creates, so this means its cleanup missed
+      them or a previous class left them - delete them in CICMS before handover).
+      NG-SOAR library: {{ puc2_pf_books }}.
+      "body returned: False" means the read never happened — the key was
+      rejected or the service did not answer — and nothing above it can be
+      trusted; fix that first. Otherwise the resource is genuinely missing.
+      Diagnose without a dashboard:
+      `ansible-playbook provisioning/playbook.yml --tags puc2_diag --limit docker-server`
+      Re-run: `ansible-playbook provisioning/playbook.yml --limit docker-server`
+    success_msg: >-
+      CTI-SS OK — event {{ puc2_pf_events | length }} carries
+      {{ puc2_mitre_initial_access }}, {{ puc2_mitre_execution }},
+      {{ puc2_c2_domain }} and {{ puc2_payload_md5 }}, and is published;
+      sharing group {{ puc2_misp_sharing_group_name }} present. CICMS OK — case
+      {{ puc2_case_soc_id }} present as id {{ puc2_case_found_id }}
+      ({{ puc2_case_lookup }}). NG-SOAR library:
+      {{ puc2_pf_books | length }} playbooks.
+
+# ── The CONSOLE path for the three dashboard-only levels, and credentials ─────
+# The GATE above proves the answers exist in the live services (the dashboard
+# path). These prove they are also reachable from a terminal — so a trainee
+# without a desktop is never blocked on L9, L14 or L15 — and that the dashboard
+# credentials were published inside the sandbox rather than left to "ask your
+# instructor". The helpers are read-only; running them here cannot change state.
+- name: Stat the console helpers and the credentials file
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ puc2_misp_seed_dir | default('/opt/cti-ss-seed') }}/cti_lookup.sh"
+    - "{{ puc2_iris_assets_dir | default('/opt/cicms-assets') }}/case_lookup.sh"
+    - "{{ puc2_cred_file | default('/opt/puc2/CREDENTIALS.txt') }}"
+  register: puc2_pf_console_files
+
+- name: Run the CTI-SS console helper (L9, L15)
+  ansible.builtin.command: "{{ puc2_misp_seed_dir | default('/opt/cti-ss-seed') }}/cti_lookup.sh"
+  register: puc2_pf_cti_lookup
+  changed_when: false
+  failed_when: false
+
+- name: Run the CICMS console helper (L14)
+  ansible.builtin.command: "{{ puc2_iris_assets_dir | default('/opt/cicms-assets') }}/case_lookup.sh"
+  register: puc2_pf_case_lookup
+  changed_when: false
+  failed_when: false
+
+- name: GATE — the console path answers L9, L14, L15 and credentials are published
+  ansible.builtin.assert:
+    that:
+      # Both helpers present and executable
+      - puc2_pf_console_files.results[0].stat.exists
+      - puc2_pf_console_files.results[0].stat.executable
+      - puc2_pf_console_files.results[1].stat.exists
+      - puc2_pf_console_files.results[1].stat.executable
+      # L9 + L15: the CTI helper prints the initial-access technique and the C2 IOC
+      - puc2_mitre_initial_access in (puc2_pf_cti_lookup.stdout | default(''))
+      - puc2_mitre_execution in (puc2_pf_cti_lookup.stdout | default(''))
+      - puc2_c2_domain in (puc2_pf_cti_lookup.stdout | default(''))
+      # L14: the CICMS helper identifies the scenario case.
+      #
+      # Asserted on the helper's RESULT line and its exit code — NOT on the bare
+      # SOC id appearing somewhere in stdout. That earlier form passed on a run
+      # where the case did not exist, because the helper's own "CASE-PUC2-2C NOT
+      # found" message contains the string being searched for. A check must not
+      # be satisfiable by the text of its own failure.
+      - puc2_pf_case_lookup.rc == 0
+      - ('RESULT: FOUND ' ~ puc2_case_soc_id) in (puc2_pf_case_lookup.stdout | default(''))
+      # Credentials published inside the sandbox as a 0600 root file
+      - puc2_pf_console_files.results[2].stat.exists
+      - puc2_pf_console_files.results[2].stat.mode == '0600'
+      - puc2_pf_console_files.results[2].stat.pw_name == 'root'
+    fail_msg: >-
+      CONSOLE-PATH preflight FAILED — a trainee without a desktop would be
+      blocked. cti_lookup.sh present:
+      {{ puc2_pf_console_files.results[0].stat.exists | default(false) }},
+      executable:
+      {{ puc2_pf_console_files.results[0].stat.executable | default(false) }};
+      prints {{ puc2_mitre_initial_access }}:
+      {{ puc2_mitre_initial_access in (puc2_pf_cti_lookup.stdout | default('')) }},
+      {{ puc2_c2_domain }}:
+      {{ puc2_c2_domain in (puc2_pf_cti_lookup.stdout | default('')) }}.
+      case_lookup.sh present:
+      {{ puc2_pf_console_files.results[1].stat.exists | default(false) }},
+      exit code {{ puc2_pf_case_lookup.rc | default('not run') }}, reports the
+      case FOUND:
+      {{ ('RESULT: FOUND ' ~ puc2_case_soc_id) in (puc2_pf_case_lookup.stdout | default('')) }}
+      (if this is false with the helper present, the scenario case is missing
+      from CICMS — check that cicms_2c actually CREATED it rather than skipping
+      creation on a false "already exists").
+      Credentials file {{ puc2_cred_file | default('/opt/puc2/CREDENTIALS.txt') }}
+      present: {{ puc2_pf_console_files.results[2].stat.exists | default(false) }},
+      mode: {{ puc2_pf_console_files.results[2].stat.mode | default('?') }}.
+      Re-run: `ansible-playbook provisioning/playbook.yml --limit docker-server`
+    success_msg: >-
+      Console path OK — cti_lookup.sh answers L9 ({{ puc2_mitre_initial_access }})
+      and L15 ({{ puc2_c2_domain }}), case_lookup.sh answers L14
+      ({{ puc2_case_soc_id }}), and the dashboard credentials are published at
+      {{ puc2_cred_file | default('/opt/puc2/CREDENTIALS.txt') }} (0600 root).
+      Every hands-on level is now answerable from a terminal.

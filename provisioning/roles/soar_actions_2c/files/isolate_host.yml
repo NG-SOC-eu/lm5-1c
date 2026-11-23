@@ -1,0 +1,62 @@
+---
+# NG-SOAR containment playbook: network isolation of an affected endpoint.
+# UML step 10. Drops all traffic except the SOC management subnet so the SIEM
+# agent and SOAR control channel keep working while the host is quarantined.
+- name: Isolate affected endpoint
+  hosts: "{{ target | default('all') }}"
+  become: true
+  vars:
+    sandbox_cidr: "10.0.16.0/24"
+    admin_ssh_port: 22
+    isolation_status: isolated
+  tasks:
+    - name: Allow established/related connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        ctstate: ["ESTABLISHED", "RELATED"]
+        jump: ACCEPT
+
+    - name: Allow SOC management subnet (SIEM + SOAR control)
+      ansible.builtin.iptables:
+        chain: INPUT
+        source: "{{ sandbox_cidr }}"
+        jump: ACCEPT
+
+    # Same reason as in the live active response (puc2-isolate): the endpoint is
+    # reached over the CyberRangeCZ management interface, which is outside
+    # sandbox_cidr. Without this, isolation locks the responder out too.
+    - name: Preserve the administrative control channel
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ admin_ssh_port }}"
+        ctstate: ["NEW"]
+        jump: ACCEPT
+
+    - name: Drop all other inbound traffic
+      ansible.builtin.iptables:
+        chain: INPUT
+        policy: DROP
+
+    - name: Drop all outbound traffic except SOC subnet
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        destination: "{{ sandbox_cidr }}"
+        jump: ACCEPT
+
+    - name: Set default OUTPUT policy to DROP
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        policy: DROP
+
+    # First line MUST be the status word alone: training level L20 grades it,
+    # and puc2-isolate (the live path) writes the same marker the same way.
+    - name: Mark host as isolated
+      ansible.builtin.copy:
+        dest: /var/run/ngsoar_isolated
+        content: |
+          {{ isolation_status }}
+          isolated_by=ng_soar/isolate_host.yml
+          allow_cidr={{ sandbox_cidr }}
+          admin_channel=tcp/{{ admin_ssh_port }} (preserved)
+        mode: "0644"

@@ -1,0 +1,101 @@
+<!--
+  NG-SIEM custom correlation rules - PUC2 (CYNET) Sub Case 2c.
+  Deployed by role ng_siem_rules_2c onto the wazuh-manager of the siemng image
+  (host ng-siem, {{ puc2_ng_siem_ip }}) provisioned by the integrations substrate.
+
+  UML coverage:
+    100100 -> step 3 : payload lands in a monitored path (file-hash telemetry)
+    100101 -> step 4/5: hash matches the CTI-SS watchlist -> MALWARE ALERT
+    100102 -> step 6 : blocked outbound C2/exfil attempt (firewall source)
+    100103 -> step 6 : correlated targeted-attack confirmation
+
+  Rule 100103 alone triggers the puc2-isolate active response (UML steps 9-10)
+  - see ng_siem_rules_2c/tasks/main.yml. 100101 deliberately does NOT: it fires
+  on the first payload drop, and containing there would cut the delivery short
+  before 100102 ever sees the C2 beacon.
+
+  MITRE ATT&CK: T1566 Phishing, T1204 User Execution,
+                T1021 Lateral Movement, T1048 Exfiltration.
+-->
+<group name="puc2,malware,local,">
+
+  <!-- Suspicious payload written to a user-writable path.
+       550 = integrity checksum changed, 554 = file added to the system.
+
+       type="pcre2" is not decoration. analysisd rejected this rule outright
+       with "Syntax error on tag 'file' in rule 100100" and refused the whole
+       file with it, which is why none of 100100-100103 ever loaded even after
+       the file was moved to a directory that is read. Wazuh's default engine
+       is OS_Regex, which has no parenthesised alternation, so the pattern
+       below cannot compile there. PCRE2 is the documented way to ask for the
+       syntax this pattern is written in. -->
+  <rule id="100100" level="8">
+    <if_sid>550,554</if_sid>
+    <field name="file" type="pcre2">\.(exe|scr|js|vbs|ps1|sh)$</field>
+    <description>PUC2: suspicious payload file created (possible phishing payload)</description>
+    <mitre>
+      <id>T1204</id>
+    </mitre>
+  </rule>
+
+  <!-- File hash present on the CTI/IOC watchlist seeded from CTI-SS (MISP).
+
+       The field is md5, NOT md5_after. The alert JSON prints the new hash as
+       syscheck.md5_after, but that is output naming only: analysisd names the
+       FIM decoder field md5 (FIM_MD5 in decoders/syscheck.c, Wazuh 4.4.0), and
+       a list lookup on a named field resolves it by that name. Keyed on
+       md5_after the lookup found no field at all, so this rule never matched,
+       while 100100 above, keyed on the decoder name file, fired normally
+       (rehearsal of 2026-09-14 11:48). -->
+  <rule id="100101" level="12">
+    <if_sid>100100</if_sid>
+    <list field="md5" lookup="match_key">etc/lists/cti-malware-hashes</list>
+    <description>PUC2: file hash matches CTI-SS malware IOC - MALWARE DETECTED</description>
+    <mitre>
+      <id>T1566</id>
+    </mitre>
+  </rule>
+
+  <!-- Outbound C2 / exfiltration attempt, blocked and logged by the endpoint's
+       pre-staged iptables LOG+DROP rule for tcp/{{ puc2_c2_port }}.
+
+       NOTHING BELOW MAY NEST A TAG INSIDE A COMMENT. Wazuh parses this file
+       with OS_XML, not a real XML parser, and every earlier version of this
+       comment named the rule options it was discussing in angle brackets. The
+       rule was rewritten three times - keyed on a custom decoder, then on a
+       group, then on this explicit parent - and analysisd produced a byte for
+       byte identical result each time, never once mentioning rule 100102 in
+       its ruleset warnings or its rule traversal. That is the signature of a
+       file that is not being read at all, not of a rule in the wrong place, so
+       the nested tags are gone until the file is proven to load.
+
+       Parent is 4100, the built-in "firewall rules grouped" rule that
+       wazuh-logtest shows matching the endpoint's kernel line. The built-in
+       kernel decoding already populates srcip, dstip, srcport, dstport and
+       protocol, so no custom decoder is involved and no port condition is
+       needed: the endpoint's LOG rule carries the {{ puc2_fw_log_prefix }}
+       prefix on tcp/{{ puc2_c2_port }} and nothing else, so the prefix alone
+       identifies a blocked C2 beacon. Evidence for UML step 6 and level L11
+       must not hinge on field extraction succeeding. -->
+  <rule id="100102" level="10">
+    <if_sid>4100</if_sid>
+    <match>{{ puc2_fw_log_prefix }}</match>
+    <description>PUC2: blocked outbound connection from endpoint (possible C2/exfil)</description>
+    <mitre>
+      <id>T1048</id>
+    </mitre>
+  </rule>
+
+  <!-- Correlated targeted-attack pattern: the IOC is seen repeatedly inside the
+       window. inject_scenario.sh performs a multi-stage delivery precisely so
+       this rule is reachable - a single payload drop would fire 100101 once and
+       leave UML step 6 without a live trigger. -->
+  <rule id="100103" level="14" frequency="2" timeframe="600">
+    <if_matched_sid>100101</if_matched_sid>
+    <description>PUC2: correlated targeted malware attack confirmed (repeated IOC + C2)</description>
+    <mitre>
+      <id>T1021</id>
+    </mitre>
+  </rule>
+
+</group>

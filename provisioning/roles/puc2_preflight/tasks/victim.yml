@@ -1,0 +1,79 @@
+---
+# Endpoint side of the gate: L4 (arm token), L5 (lure), L8 (payload hash) and
+# the containment action L20/L21 read back.
+#
+# `--arm` is the scenario script's read-only mode. It fires nothing: it checks
+# the payload is staged with the right hash, the phishing mail was delivered,
+# the Wazuh agent is reporting, the active response is deployed, the egress
+# filter is armed and the C2 name resolves — then prints the token L4 grades.
+# Running it here means the deployment proves those eight things itself.
+
+- name: Arm the scenario (read-only readiness check)
+  ansible.builtin.command: "{{ puc2_injection_root }}/inject_scenario.sh --arm"
+  register: puc2_pf_arm
+  changed_when: false
+  failed_when: false
+
+# L5's answer is read out of the lure with `grep -i 'href=' /var/mail/victim`.
+# `--arm` only checks the spool is non-empty, so an email that rendered without
+# its link would arm cleanly and still leave the level unanswerable by the
+# route the level itself prescribes.
+- name: Read the delivered phishing email
+  ansible.builtin.slurp:
+    src: "{{ puc2_victim_mail_spool }}"
+  register: puc2_pf_mail
+  failed_when: false
+
+- name: Read the deployed containment action
+  ansible.builtin.slurp:
+    src: /var/ossec/active-response/bin/puc2-isolate
+  register: puc2_pf_ar_script
+
+- name: Inspect the containment action's permissions
+  ansible.builtin.stat:
+    path: /var/ossec/active-response/bin/puc2-isolate
+  register: puc2_pf_ar_stat
+
+- name: GATE — the endpoint is ready to be attacked and to be contained
+  ansible.builtin.assert:
+    that:
+      # L4: the exact token, printed by a run in which every check passed
+      - "('token=' ~ puc2_arm_token) in (puc2_pf_arm.stdout | default(''))"
+      - "'[FAIL]' not in (puc2_pf_arm.stdout | default('[FAIL]'))"
+      # L5: the payload name has to be readable off the lure's link, which is
+      # the route the level prescribes
+      - "'href=' in (puc2_pf_mail.content | default('') | b64decode)"
+      - puc2_payload_name in (puc2_pf_mail.content | default('') | b64decode)
+      # L20/L21: the action must exist, be executable by the agent...
+      - puc2_pf_ar_stat.stat.exists
+      - puc2_pf_ar_stat.stat.executable
+      # ...write the graded status words on the first line of each marker...
+      - puc2_isolation_marker in (puc2_pf_ar_script.content | b64decode)
+      - puc2_eradication_marker in (puc2_pf_ar_script.content | b64decode)
+      # ...keep saying `eradicated` when containment runs a SECOND time. Level 9
+      # tells the trainee to re-trigger it and the phase text promises that is
+      # idempotent; deriving the status from this run's move count alone erases
+      # L21's answer the moment they comply.
+      - "'QUARANTINE_HELD' in (puc2_pf_ar_script.content | b64decode)"
+      # ...and keep the endpoint reachable afterwards, or L20 and L21 cannot be
+      # answered over SSH at all once containment has run.
+      - "'--dport \"${SSH_PORT}\"' in (puc2_pf_ar_script.content | b64decode)"
+    fail_msg: >-
+      Endpoint preflight FAILED — trainees would hit a blocking level.
+      inject_scenario.sh --arm said:
+      {{ puc2_pf_arm.stdout_lines | default(['(no output)']) | join(' | ') }}
+      {{ puc2_pf_arm.stderr | default('') }}
+      Every [FAIL] line above is a level a trainee cannot complete.
+      Phishing lure carries a link: {{ 'href=' in (puc2_pf_mail.content | default('') | b64decode) }},
+      naming {{ puc2_payload_name }}:
+      {{ puc2_payload_name in (puc2_pf_mail.content | default('') | b64decode) }}
+      (level 2 answers L5 with `grep -i 'href=' {{ puc2_victim_mail_spool }}`).
+      Re-run: ansible-playbook provisioning/playbook.yml --limit victim
+    success_msg: >-
+      Endpoint OK — every readiness check passed,
+      token '{{ puc2_arm_token }}' printed, containment action deployed with the
+      administrative channel preserved.
+
+- name: Show the full arm output for the record
+  ansible.builtin.debug:
+    var: puc2_pf_arm.stdout_lines

@@ -1,0 +1,190 @@
+---
+# Bootstrap DFIR-IRIS API key, probed before falling back to reading the real
+# one out of iris_db.
+#
+# EMPTY BY DEFAULT, AND THAT IS THE INTENDED STATE. A long-lived credential was
+# hardcoded here in the substrate; the live instance rejects it (the 404 probe
+# in the build log), so it bought nothing, and a key in a git repository is a
+# key to rotate rather than a key to keep. With this empty the probe is skipped
+# and the role goes straight to the database — which is what already happened in
+# practice, one wasted failed request later.
+#
+# Set `vault_iris_bootstrap_key` in group_vars/vault.yml (git-ignored, and
+# encrypt it with ansible-vault) if a pre-seeded key is ever genuinely needed.
+iris_bootstrap_api_key: "{{ vault_iris_bootstrap_key | default('') }}"
+
+# ── Which revision of misp-docker to build, and which images to run ──────────
+# PINNED - the clone AND its images - after `master` broke three deployments in a
+# row with one restructure:
+#
+#   compose variables renamed   ~130 warnings drowning every build log
+#   CORE_*_PORT -> NGINX_*_PORT MISP published on :443, the project used :8443
+#   ./ssl moved, read-only      no certificate, SSL disabled, nothing listening
+#
+# None was predictable from the one before it, each cost a deploy, and each
+# surfaced the same way: HTTP -1, eight plays downstream.
+#
+# The first pin (5fe2022) fixed only the clone. The compose file pulls its images
+# by TAG - `latest` unless CORE_RUNNING_TAG says otherwise - and on 2026-09-11
+# 12:52 upstream CI rebuilt `latest`, and the version tag v2.5.46 with it, from
+# e8b11b9. A ghcr tag is a moving label: the 2026-09-14 deploy ran a 5fe2022
+# compose file against images built two commits later. Both halves now come from
+# ONE commit - the clone by sha, every image by digest, the images written into
+# docker-compose.override.yml by the role.
+#
+# e8b11b9 is upstream's own coherent pairing, but NOT yet proven end to end here.
+# Against 5fe2022 it changes only nginx/files/01-listen.sh, nginx/files/04-ssl.sh
+# and one healthcheck interval, and both nginx changes enforce what this role
+# already provides: cert.pem/key.pem present and an https BASE_URL.
+#
+# TO BUMP IT: choose a newer upstream commit. ghcr tags each image with that
+# commit's 7-character sha (misp-core:e8b11b9 and so on) - resolve each tag to its
+# digest, change the clone sha and all four digests together, deploy, and confirm
+# docker-server ends failed=0 and the MISP HTTPS gate passes. Never a branch name
+# or a version tag: a training range wants the build it was tested with.
+misp_docker_version: "e8b11b9dd85c81deb6f41679f350b95b110a1d45"
+misp_docker_images:
+  misp-core: "ghcr.io/misp/misp-docker/misp-core@sha256:cce037ef71c22457e65a1c75ab8bce07c3950ccd62a50694145a4fa530c7c16d"
+  misp-nginx: "ghcr.io/misp/misp-docker/misp-nginx@sha256:0df35c71ed517d165c42b641d3b804b2a1d58df918e6429b7eed144bab56afb1"
+  misp-modules: "ghcr.io/misp/misp-docker/misp-modules@sha256:22e9c6a7d925a8dac096ad2f13f7fc6fc956dfddcbf0dedc1837c4088956d4ab"
+  misp-guard: "ghcr.io/misp/misp-docker/misp-guard@sha256:7bece761bccb02fb949328028740176452530a67f1bfdf6db849feeefcf113d8"
+
+# How long misp-core may take to open php-fpm on 9002 before its healthcheck starts
+# counting failures. Upstream ships 60s. A passing probe ends the start period at
+# once, so this delays nothing when MISP is healthy; it only stops a slow first
+# boot from being reported as a broken one. See the override task for the why.
+misp_core_start_period: "600s"
+
+# ── Where MISP is published on the host ──────────────────────────────────────
+# The whole project addresses MISP at :8443 — group_vars/puc2_2c.yml, the
+# cti_lookup.sh / share_intel.sh helpers, the preflight gate's dashboard probe,
+# and four levels of the training definition (L1, L9, L15, L24). One variable
+# here so the .env and the assert after the deploy cannot drift apart.
+#
+# 8443 is NOT the upstream default. misp-docker publishes on 80/443 unless told
+# otherwise, and 443 on this host is a scarce port — iris_nginx is already there
+# behind 8083. Keeping MISP on 8443 is what lets every address above stay true.
+misp_http_host_port: 8082
+misp_https_host_port: 8443
+
+# ── The substrate's own Docker Hub credential ────────────────────────────────
+# ng-soc-ansible@integrations carries a hardcoded Docker Hub login in
+# roles/docker_server/tasks/main.yml. This repo removed it, because a credential
+# in a git repository is a credential to rotate - see validation/
+# SECURITY_ROTATION.md - and lm5-1c is public, so committing it here would
+# republish it to a second public location.
+#
+# It is still USED, just never STORED: the task reads it from the upstream repo
+# at deploy time over HTTPS and pipes it straight into `docker login
+# --password-stdin`. It never becomes an Ansible variable, never appears in a
+# process argument, and nothing secret is written into this repository.
+#
+# Why bother, when the pre-pull below already cuts Docker Hub to two images:
+# an authenticated pull is counted against the ACCOUNT, not the egress IP.
+# Verified 2026-09-10 against the live registry - the account answers
+# `docker-ratelimit-source: demongsoc` with `ratelimit-limit: 200;w=3600`,
+# so those two pulls stop competing with every other sandbox on the platform.
+#
+# KNOW WHAT THIS IS. The credential is public: anyone who reads that repository
+# can use it, its 200/hour is shared with all of them, and it can be revoked or
+# rotated upstream without warning. Every one of those cases degrades to an
+# anonymous pull, which is why nothing here is fatal. An explicit
+# -e vault_dockerhub_pat=... always wins over it.
+substrate_docker_login_url: >-
+  https://raw.githubusercontent.com/NG-SOC-eu/ng-soc-ansible/integrations/provisioning/roles/docker_server/tasks/main.yml
+
+# Set false to skip it and pull anonymously (or with your own PAT only).
+substrate_docker_login_enabled: true
+
+# ── Docker Hub rate limiting ─────────────────────────────────────────────────
+# Anonymous pulls are capped per egress IP, and every sandbox on this platform
+# shares one. The 2026-09-10 09:37 build died on it: five Docker Hub images
+# pulled, the sixth (rabbitmq:3.8-management, for DFIR-IRIS) came back 429 and
+# took the whole deployment with it in play one.
+#
+# What made that worse than it had to be: the compose task retried five times at
+# 30-second intervals, because the retry was written for transient network
+# resets. A rate limit is not a transient reset — its window is measured in
+# hours — so the retries recovered nothing, spent 2.5 minutes, and issued four
+# more requests against the very limit that was the problem. Worse, the failure
+# read like a flaky network, which is the opposite of what an operator needs to
+# see: the fix is a PAT, and nothing about "attempts: 5" says so.
+#
+# Matched against the module's own message and stderr. Deliberately broad: the
+# daemon has worded this several ways (429, "toomanyrequests", the pull-limit
+# help URL), and over-matching costs a clearer error message on some other
+# failure, while under-matching costs another blind 20-minute deploy.
+docker_hub_rate_limit_pattern: '429|toomanyrequests|too many requests|pull rate limit|rate limit'
+
+# Shown when a pull is rate-limited. Kept here so the three compose tasks that
+# pull from Docker Hub all say the same thing rather than drifting apart.
+docker_hub_rate_limit_help: >-
+  DOCKER HUB RATE LIMIT (HTTP 429) - this is not a network fault and retrying
+  will not clear it: the quota is per egress IP, shared by every sandbox on the
+  platform, and its window is hours, not seconds.
+  Re-run supplying a Docker Hub token, which raises the limit:
+  ansible-playbook provisioning/playbook.yml
+  -e vault_dockerhub_pat=dckr_pat_... -e vault_dockerhub_user=<user>
+  A local group_vars/vault.yml does NOT work - it is git-ignored, so it never
+  reaches the sandbox; the PAT has to be an extra var on the deployment command.
+  Rotate before reusing: the PAT that used to be hardcoded in this role is
+  public (see validation/SECURITY_ROTATION.md).
+
+# ── Getting off Docker Hub for most of the images ────────────────────────────
+# This role needs six images from Docker Hub, and the anonymous quota is per
+# egress IP, shared by every sandbox on the platform. FOUR of the six are served
+# elsewhere, by registries that do not share that limit:
+#
+#   mariadb, rabbitmq, mongo   Docker OFFICIAL images, mirrored by AWS in its
+#                              public ECR gallery
+#   valkey                     published by the Valkey project itself on ghcr.io
+#
+# Each is pulled from the alternative and re-tagged under the Docker Hub name,
+# so compose finds it already in the local image cache and never asks Docker Hub.
+#
+# THESE ARE THE SAME IMAGES, not lookalikes - verified 2026-09-10 by comparing
+# manifest digests across registries:
+#   rabbitmq:3.8-management  docker.io and public.ecr.aws  -> sha256:4206c16c…
+#   valkey/valkey:7.2        docker.io and ghcr.io         -> sha256:1bbb9126…
+# both identical. All four tags answered HTTP 200 on the alternative registry.
+#
+# Re-tagging rather than rewriting the compose files is deliberate: all three
+# files are upstream artefacts (misp-docker cloned from upstream, NG-SOAR off the
+# SMB share, dfir-iris-custom unzipped), and editing them means re-doing the
+# edit every time upstream moves. The local image cache is a supported way to
+# say "already have it" and needs no edit at all.
+#
+# Still never fatal: a tag that has since moved falls back to Docker Hub, which
+# is the behaviour that existed before this task.
+#
+# The remaining two - cossas/soarca and cyentific/cacao-roaster - publish only
+# to Docker Hub (checked: neither is on ghcr.io under COSSAS,
+# opencybersecurityalliance or cyentific). They are what keeps the PAT relevant
+# at all, and two pulls is a far smaller target than six.
+docker_hub_prepull:
+  - hub: "mariadb:10.11"                     # MISP
+    from: "public.ecr.aws/docker/library/mariadb:10.11"
+  - hub: "valkey/valkey:7.2"                 # MISP
+    from: "ghcr.io/valkey-io/valkey:7.2"
+  - hub: "rabbitmq:3.8-management"           # DFIR-IRIS - killed the 09:37 build
+    from: "public.ecr.aws/docker/library/rabbitmq:3.8-management"
+  - hub: "mongo:latest"                      # NG-SOAR
+    from: "public.ecr.aws/docker/library/mongo:latest"
+
+# ── Failing in ten seconds instead of twenty minutes ─────────────────────────
+# What a cold deploy still needs FROM DOCKER HUB once the pre-pull above has
+# done its work: cossas/soarca and cyentific/cacao-roaster. Used only to decide
+# whether the measured headroom is worth starting on - a preflight, not an
+# accountant. Raise it back towards six if the pre-pull is disabled or the
+# alternative registries stop carrying these tags.
+docker_hub_required_pulls: 2
+
+# Set false to skip the preflight entirely (an air-gapped mirror, a registry
+# proxy, or any setup where reaching auth.docker.io is not meaningful).
+docker_hub_preflight_enabled: true
+
+# ── DFIR-IRIS administrator password ─────────────────────────────────────────
+# Random per deploy, written here (root, 0600) and set with IRIS's own bcrypt;
+# puc2_credentials publishes it in CREDENTIALS.txt. Never a fixed value: the
+# upstream substrate's "IrisAdmin123" is public.
+iris_admin_password_file: "/root/.puc2_iris_admin_password"
