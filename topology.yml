@@ -1,4 +1,4 @@
-name: lm5-1c-malware-attack-detection-and-response
+name: lm5-1c-puc2-subcase2c-malware-attack-detection-and-response
 hosts:
   - name: kali
     base_box:
